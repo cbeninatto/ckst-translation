@@ -34,7 +34,6 @@ espuma=foam
 reforço=reinforcement
 fita=webbing tape
 viés=bias tape
-vivo=piping
 pesponto=topstitching
 costura=stitching
 alça=strap
@@ -147,7 +146,6 @@ def run_translation() -> List[Tuple[str, bytes]]:
             if ext == "pdf":
 
                 def on_pdf_progress(page_idx: int, total_pages: int):
-                    # page_idx can equal total_pages at the end
                     if total_pages <= 0:
                         return
                     if page_idx < total_pages:
