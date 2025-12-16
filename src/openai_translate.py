@@ -17,13 +17,13 @@ class TranslationItem:
 
 
 class OpenAITranslator:
-    def __init__(self, api_key: Optional[str], model: str):
-        # If api_key is None, OpenAI() will read OPENAI_API_KEY from env automatically
+    def __init__(self, api_key: Optional[str], model: str, reasoning_effort: str = "low"):
         self.client = OpenAI(api_key=api_key) if api_key else OpenAI()
         self.model = model
+        self.reasoning_effort = reasoning_effort  # none|minimal|low|medium|high|xhigh
 
     @staticmethod
-    def _schema():
+    def _schema_batch():
         return {
             "type": "object",
             "properties": {
@@ -44,6 +44,89 @@ class OpenAITranslator:
             "additionalProperties": False,
         }
 
+    @staticmethod
+    def _schema_single():
+        return {
+            "type": "object",
+            "properties": {"translated": {"type": "string"}},
+            "required": ["translated"],
+            "additionalProperties": False,
+        }
+
+    def _system_prompt(
+        self,
+        source_lang: str,
+        target_lang: str,
+        glossary: Dict[str, str],
+        extra_instructions: str,
+    ) -> str:
+        system = (
+            "You are a professional technical translator specialized in HANDBAGS / SOFTGOODS development packs.\n"
+            f"Translate from {source_lang} to {target_lang}.\n\n"
+            "Critical rules:\n"
+            "- Keep all placeholders like <KEEP_0> exactly unchanged.\n"
+            "- Do NOT change numbers, units, dimensions, tolerances, weights, percentages.\n"
+            "- Do NOT change SKUs, color codes, barcodes, internal references, supplier codes.\n"
+            "- Use handbag manufacturing terminology (materials, linings, padding, reinforcement, hardware, trims).\n"
+            "- Prefer factory-friendly English: short, clear sentences; no idioms; actionable wording.\n"
+            "- Preserve line breaks when they separate specs/components.\n"
+            "- If a Portuguese term is ambiguous, choose the most common meaning in handbags.\n"
+            "- If the text lists components, keep the same component order.\n"
+        )
+
+        if glossary:
+            system += (
+                "\nPreferred glossary (must be respected):\n"
+                + "\n".join([f"- {k} => {v}" for k, v in glossary.items()])
+                + "\n"
+            )
+
+        if extra_instructions.strip():
+            system += "\nAdditional instructions:\n" + extra_instructions.strip() + "\n"
+
+        return system
+
+    @retry(
+        reraise=True,
+        stop=stop_after_attempt(4),
+        wait=wait_exponential(multiplier=1, min=1, max=12),
+        retry=retry_if_exception_type(Exception),
+    )
+    def translate_text(
+        self,
+        text: str,
+        source_lang: str,
+        target_lang: str,
+        glossary: Dict[str, str],
+        extra_instructions: str = "",
+    ) -> str:
+        pt = protect_text(text)
+        system = self._system_prompt(source_lang, target_lang, glossary, extra_instructions)
+
+        resp = self.client.responses.create(
+            model=self.model,
+            input=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": pt.text},
+            ],
+            text={
+                "format": {
+                    "type": "json_schema",
+                    "name": "translation_single",
+                    "schema": self._schema_single(),
+                    "strict": True,
+                }
+            },
+            reasoning={"effort": self.reasoning_effort},
+            temperature=0,
+            store=False,
+        )
+
+        data = json.loads(resp.output_text)
+        translated = data["translated"]
+        translated = restore_protected(translated, pt.placeholder_to_original)
+        return translated
+
     @retry(
         reraise=True,
         stop=stop_after_attempt(4),
@@ -58,11 +141,6 @@ class OpenAITranslator:
         glossary: Dict[str, str],
         extra_instructions: str = "",
     ) -> Dict[str, str]:
-        """
-        Returns dict id -> translated_text
-        Uses Structured Outputs (JSON schema) via Responses API.
-        """
-        # Protect codes/measurements so the model doesn't "translate" them.
         protected_map: Dict[str, ProtectedText] = {}
         payload_items = []
         for it in items:
@@ -70,51 +148,25 @@ class OpenAITranslator:
             protected_map[it.id] = pt
             payload_items.append({"id": it.id, "text": pt.text})
 
-        system = (
-            "You are a professional technical translator for handbag development files.\n"
-            f"Translate from {source_lang} to {target_lang}.\n"
-            "Rules:\n"
-            "- Keep all placeholders like <KEEP_0> exactly unchanged.\n"
-            "- Do NOT change numbers, units, dimensions, percentages, SKUs, barcodes, or codes.\n"
-            "- Preserve line breaks where they help readability.\n"
-            "- Keep brand names as-is.\n"
-            "- Use clear, factory-friendly English.\n"
-            "- If a Portuguese term is ambiguous, choose the most common manufacturing meaning.\n"
-        )
+        system = self._system_prompt(source_lang, target_lang, glossary, extra_instructions)
 
-        if glossary:
-            system += (
-                "\nGlossary (must be respected as preferred translations):\n"
-                + "\n".join([f"- {k} => {v}" for k, v in glossary.items()])
-                + "\n"
-            )
-
-        if extra_instructions.strip():
-            system += "\nAdditional instructions:\n" + extra_instructions.strip() + "\n"
-
-        user_obj = {
-            "source_language": source_lang,
-            "target_language": target_lang,
-            "items": payload_items,
-        }
-
+        user_obj = {"items": payload_items}
         resp = self.client.responses.create(
             model=self.model,
             input=[
                 {"role": "system", "content": system},
                 {"role": "user", "content": json.dumps(user_obj, ensure_ascii=False)},
             ],
-            # Structured output:
             text={
                 "format": {
                     "type": "json_schema",
                     "name": "translation_batch",
-                    "schema": self._schema(),
+                    "schema": self._schema_batch(),
                     "strict": True,
                 }
             },
+            reasoning={"effort": self.reasoning_effort},
             temperature=0,
-            # Reduce retention (helpful for confidential docs):
             store=False,
         )
 
@@ -123,27 +175,6 @@ class OpenAITranslator:
         for row in data["translations"]:
             tid = row["id"]
             translated = row["translated"]
-            # Restore protected tokens
             translated = restore_protected(translated, protected_map[tid].placeholder_to_original)
             out[tid] = translated
         return out
-
-
-def chunk_items(items: List[TranslationItem], max_chars: int = 18000, max_items: int = 60) -> List[List[TranslationItem]]:
-    batches: List[List[TranslationItem]] = []
-    cur: List[TranslationItem] = []
-    cur_chars = 0
-
-    for it in items:
-        tlen = len(it.text or "")
-        if cur and (len(cur) >= max_items or (cur_chars + tlen) > max_chars):
-            batches.append(cur)
-            cur = []
-            cur_chars = 0
-        cur.append(it)
-        cur_chars += tlen
-
-    if cur:
-        batches.append(cur)
-
-    return batches
