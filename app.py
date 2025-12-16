@@ -5,119 +5,158 @@ import zipfile
 from io import BytesIO
 from typing import Dict, List, Tuple
 
-import pandas as pd
 import streamlit as st
 
 from src.openai_translate import OpenAITranslator
 from src.pdf_translate import translate_pdf_bytes
 from src.pptx_translate import translate_pptx_bytes
-from src.text_utils import parse_glossary_lines, apply_glossary_hard
+from src.text_utils import parse_glossary_lines
 
 
 st.set_page_config(page_title="Handbag Dev Translator (PT→EN)", layout="wide")
 
 st.title("Handbag Dev Translator (PT-BR → English)")
-st.caption("Upload PDF/PPTX from designers, translate to factory-friendly English, download translated files.")
+st.caption("Translate designer PDF/PPTX to factory-friendly English (handbag terminology).")
 
-# ---- Sidebar settings ----
+DEFAULT_HANDBAG_GLOSSARY = """\
+couro=leather
+couro legítimo=genuine leather
+couro sintético=synthetic leather
+napa=nappa (leather/PU)
+camurça=suede
+microfibra=microfiber
+lona=canvas
+sarja=twill
+forro=lining
+forração=lining
+entretela=interlining
+espuma=foam
+reforço=reinforcement
+fita=webbing tape
+viés=bias tape
+vivo=piping
+pesponto=topstitching
+costura=stitching
+alça=strap
+alça de mão=top handle
+alça tiracolo=crossbody strap
+regulador=adjuster buckle
+fivela=buckle
+mosquetão=swivel snap hook
+argola=D-ring
+meia argola=half D-ring
+rebite=rivet
+ilhós=grommet
+zíper=zipper
+cursor=zipper slider
+puxador=zipper puller
+ferragem=hardware
+banho=plating
+níquel=nickel
+ouro=gold
+ouro velho=antique gold
+grafite=graphite
+gunmetal=gunmetal
+"""
+
+# ---- Sidebar ----
 with st.sidebar:
     st.header("Settings")
 
-    # Prefer secrets/env; fallback to manual input
     key_from_secrets = st.secrets.get("OPENAI_API_KEY") if hasattr(st, "secrets") else None
     api_key = key_from_secrets or os.getenv("OPENAI_API_KEY")
     if not api_key:
-        api_key = st.text_input("OpenAI API key", type="password", help="Prefer using Streamlit secrets or env vars.")
+        api_key = st.text_input("OpenAI API key", type="password")
 
-    model = st.text_input("Model", value="gpt-4o-mini", help="Any model available in your OpenAI project.")
+    st.subheader("Model (latest)")
+    model = st.selectbox(
+        "Choose model",
+        options=["gpt-5.2", "gpt-5.2-pro", "gpt-5.2-chat-latest"],
+        index=0,
+        help="gpt-5.2 = best default. gpt-5.2-pro = max quality. gpt-5.2-chat-latest = faster/cheaper style.",
+    )
+
+    reasoning_effort = st.selectbox(
+        "reasoning.effort",
+        options=["none", "minimal", "low", "medium", "high", "xhigh"],
+        index=2,
+        help="Higher can help with ambiguous technical wording (but uses more tokens).",
+    )
 
     source_lang = st.text_input("Source language", value="pt-BR")
     target_lang = st.text_input("Target language", value="en-US")
 
     st.divider()
-    st.subheader("Glossary")
+    st.subheader("Handbag terminology pack")
+    use_default_pack = st.checkbox("Use built-in handbag glossary", value=True)
+
     glossary_raw = st.text_area(
-        "One per line: Portuguese=English",
-        value="",
-        placeholder="couro=leather\nforro=lining\nferragem=hardware\nalça=strap\n",
-        height=140,
+        "Glossary (Portuguese=English), one per line",
+        value=(DEFAULT_HANDBAG_GLOSSARY if use_default_pack else ""),
+        height=220,
     )
     glossary = parse_glossary_lines(glossary_raw)
 
-    hard_glossary = st.checkbox(
-        "Hard enforce glossary (post-processing)",
-        value=False,
-        help="If enabled, we also apply simple replacements after translation.",
-    )
-
-    st.divider()
-    st.subheader("Translation behavior")
     extra_instructions = st.text_area(
         "Extra instructions (optional)",
-        value="Use concise manufacturing English. Prefer handbag/material terminology.",
-        height=100,
+        value=(
+            "Write like a handbag tech pack for Chinese factories.\n"
+            "Prefer terms: lining, reinforcement, piping, topstitching, hardware.\n"
+            "If a word could be 'handle' vs 'strap', pick based on handbag context.\n"
+            "Keep bullet lists as bullet lists.\n"
+        ),
+        height=140,
     )
 
-    st.divider()
-    st.subheader("Batching (advanced)")
-    max_chars = st.slider("Max characters per API call", 6000, 30000, 18000, 1000)
-    max_items_pptx = st.slider("Max text items per PPTX call", 10, 120, 60, 5)
-    max_items_pdf = st.slider("Max pages per PDF call", 5, 60, 25, 5)
-
-# ---- Upload UI ----
+# ---- Upload ----
 uploaded = st.file_uploader(
     "Upload PDF and/or PPTX (multiple allowed)",
     type=["pdf", "pptx"],
     accept_multiple_files=True,
 )
 
-colA, colB = st.columns([1, 1])
-with colA:
-    translate_btn = st.button("Translate", type="primary", disabled=(not uploaded or not api_key))
-with colB:
-    st.write("")
+translate_btn = st.button("Translate", type="primary", disabled=(not uploaded or not api_key))
 
 if not uploaded:
-    st.info("Upload some files to begin.")
+    st.info("Upload files to begin.")
     st.stop()
 
 if translate_btn and not api_key:
-    st.error("Missing OpenAI API key. Add it via Streamlit secrets or environment variable.")
+    st.error("Missing OpenAI API key.")
     st.stop()
 
-# ---- Work ----
-def _translate_files() -> Tuple[List[Tuple[str, bytes]], List[Dict]]:
-    translator = OpenAITranslator(api_key=api_key, model=model)
+
+def run_translation() -> List[Tuple[str, bytes]]:
+    translator = OpenAITranslator(api_key=api_key, model=model, reasoning_effort=reasoning_effort)
 
     outputs: List[Tuple[str, bytes]] = []
-    preview_rows: List[Dict] = []
 
-    progress = st.progress(0)
-    status = st.empty()
+    overall = st.progress(0)
+    overall_status = st.empty()
 
-    for idx, f in enumerate(uploaded, start=1):
+    for f_i, f in enumerate(uploaded, start=1):
         name = f.name
         ext = name.lower().split(".")[-1]
         raw = f.getvalue()
 
-        status.write(f"Translating **{name}** ({idx}/{len(uploaded)})...")
+        overall_status.write(f"Processing **{name}** ({f_i}/{len(uploaded)})...")
+        file_status = st.empty()
+        file_progress = st.progress(0)
 
         try:
-            if ext == "pptx":
-                out_bytes = translate_pptx_bytes(
-                    raw,
-                    translator=translator,
-                    source_lang=source_lang,
-                    target_lang=target_lang,
-                    glossary=glossary,
-                    extra_instructions=extra_instructions,
-                    max_chars=max_chars,
-                    max_items=max_items_pptx,
-                )
-                out_name = name.replace(".pptx", "").replace(".PPTX", "") + " — EN.pptx"
-                outputs.append((out_name, out_bytes))
+            if ext == "pdf":
 
-            elif ext == "pdf":
+                def on_pdf_progress(page_idx: int, total_pages: int):
+                    # page_idx can equal total_pages at the end
+                    if total_pages <= 0:
+                        return
+                    if page_idx < total_pages:
+                        file_status.write(f"Translating PDF page **{page_idx+1}/{total_pages}** …")
+                        file_progress.progress((page_idx + 1) / total_pages)
+                    else:
+                        file_status.write("PDF done.")
+                        file_progress.progress(1.0)
+
                 out_bytes = translate_pdf_bytes(
                     raw,
                     translator=translator,
@@ -125,47 +164,63 @@ def _translate_files() -> Tuple[List[Tuple[str, bytes]], List[Dict]]:
                     target_lang=target_lang,
                     glossary=glossary,
                     extra_instructions=extra_instructions,
-                    max_chars=max_chars,
-                    max_items=max_items_pdf,
+                    on_progress=on_pdf_progress,
                 )
-                out_name = name.replace(".pdf", "").replace(".PDF", "") + " — EN.pdf"
+
+                out_name = name.rsplit(".", 1)[0] + " — EN.pdf"
                 outputs.append((out_name, out_bytes))
 
-                # If PDF had no text, translate_pdf_bytes returns original bytes
                 if out_bytes == raw:
                     st.warning(
-                        f"⚠️ {name}: No extractable text found. This is likely a scanned/image-only PDF. "
-                        "This app currently translates text-based PDFs only."
+                        f"⚠️ {name}: No extractable text found (likely scanned/image-only PDF). "
+                        "This version translates text-based PDFs."
                     )
+
+            elif ext == "pptx":
+
+                def on_pptx_progress(slide_1based: int, total_slides: int):
+                    if total_slides <= 0:
+                        return
+                    file_status.write(f"Translating PPTX slide **{slide_1based}/{total_slides}** …")
+                    file_progress.progress(slide_1based / total_slides)
+
+                out_bytes = translate_pptx_bytes(
+                    raw,
+                    translator=translator,
+                    source_lang=source_lang,
+                    target_lang=target_lang,
+                    glossary=glossary,
+                    extra_instructions=extra_instructions,
+                    on_progress=on_pptx_progress,
+                )
+
+                out_name = name.rsplit(".", 1)[0] + " — EN.pptx"
+                outputs.append((out_name, out_bytes))
+
             else:
                 st.warning(f"Skipping unsupported file: {name}")
 
         except Exception as e:
             st.error(f"❌ Error translating {name}: {e}")
 
-        progress.progress(idx / len(uploaded))
+        file_progress.empty()
+        file_status.empty()
 
-    status.write("Done.")
-    progress.empty()
-    return outputs, preview_rows
+        overall.progress(f_i / len(uploaded))
+
+    overall_status.write("Done.")
+    overall.empty()
+    return outputs
 
 
 if translate_btn:
-    outputs, _ = _translate_files()
-
-    if hard_glossary and glossary:
-        # Optional: hard glossary pass for pptx is hard to do post-hoc safely, so we only do it
-        # for simple preview use-cases. (Most users rely on prompt-based glossary.)
-        st.info("Hard glossary enforcement was enabled. (Primary enforcement is via prompt.)")
+    outputs = run_translation()
 
     if not outputs:
-        st.error("No outputs were created.")
+        st.error("No outputs created.")
         st.stop()
 
     st.success(f"✅ Translated {len(outputs)} file(s).")
-
-    # Individual downloads + ZIP
-    st.subheader("Downloads")
 
     zip_buf = BytesIO()
     with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as z:
@@ -181,7 +236,11 @@ if translate_btn:
 
     st.divider()
     for out_name, out_bytes in outputs:
-        mime = "application/vnd.openxmlformats-officedocument.presentationml.presentation" if out_name.lower().endswith(".pptx") else "application/pdf"
+        mime = (
+            "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+            if out_name.lower().endswith(".pptx")
+            else "application/pdf"
+        )
         st.download_button(
             f"Download: {out_name}",
             data=out_bytes,
