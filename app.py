@@ -12,7 +12,6 @@ from src.pdf_translate import translate_pdf_bytes
 from src.pptx_translate import translate_pptx_bytes
 from src.text_utils import parse_glossary_lines
 
-
 st.set_page_config(page_title="Handbag Dev Translator (PT→EN)", layout="wide")
 
 st.title("Handbag Dev Translator (PT-BR → English)")
@@ -34,6 +33,7 @@ espuma=foam
 reforço=reinforcement
 fita=webbing tape
 viés=bias tape
+vivo=piping
 pesponto=topstitching
 costura=stitching
 alça=strap
@@ -58,28 +58,54 @@ grafite=graphite
 gunmetal=gunmetal
 """
 
+MODEL_OPTIONS = [
+    # GPT-4.1 family (use while org verification is pending)
+    "gpt-4.1",
+    "gpt-4.1-mini",
+    "gpt-4.1-nano",
+
+    # Keep visible for later (when enabled)
+    "gpt-5.2",
+    "gpt-5.2-pro",
+    "gpt-5-mini",
+    "gpt-5-nano",
+]
+
+REASONING_EFFORT_OPTIONS = ["none", "minimal", "low", "medium", "high", "xhigh"]
+
+
+def supports_reasoning(model: str) -> bool:
+    return model.startswith("gpt-5") or model.startswith("o")
+
+
 # ---- Sidebar ----
 with st.sidebar:
     st.header("Settings")
 
-    key_from_secrets = st.secrets.get("OPENAI_API_KEY") if hasattr(st, "secrets") else None
+    key_from_secrets = None
+    try:
+        key_from_secrets = st.secrets.get("OPENAI_API_KEY")
+    except Exception:
+        pass
+
     api_key = key_from_secrets or os.getenv("OPENAI_API_KEY")
     if not api_key:
         api_key = st.text_input("OpenAI API key", type="password")
 
-    st.subheader("Model (latest)")
+    st.subheader("Model")
     model = st.selectbox(
         "Choose model",
-        options=["gpt-5.2", "gpt-5.2-pro", "gpt-5.2-chat-latest"],
-        index=0,
-        help="gpt-5.2 = best default. gpt-5.2-pro = max quality. gpt-5.2-chat-latest = faster/cheaper style.",
+        options=MODEL_OPTIONS,
+        index=0,  # default gpt-4.1
+        help="Use GPT-4.1 while GPT-5.* isn’t enabled for your org yet.",
     )
 
     reasoning_effort = st.selectbox(
-        "reasoning.effort",
-        options=["none", "minimal", "low", "medium", "high", "xhigh"],
+        "reasoning.effort (GPT-5 only)",
+        options=REASONING_EFFORT_OPTIONS,
         index=2,
-        help="Higher can help with ambiguous technical wording (but uses more tokens).",
+        disabled=not supports_reasoning(model),
+        help="Only applies to GPT-5 / o-series reasoning models. Ignored for GPT-4.1.",
     )
 
     source_lang = st.text_input("Source language", value="pt-BR")
@@ -94,18 +120,28 @@ with st.sidebar:
         value=(DEFAULT_HANDBAG_GLOSSARY if use_default_pack else ""),
         height=220,
     )
-    glossary = parse_glossary_lines(glossary_raw)
+    glossary: Dict[str, str] = parse_glossary_lines(glossary_raw)
 
     extra_instructions = st.text_area(
         "Extra instructions (optional)",
         value=(
             "Write like a handbag tech pack for Chinese factories.\n"
             "Prefer terms: lining, reinforcement, piping, topstitching, hardware.\n"
-            "If a word could be 'handle' vs 'strap', pick based on handbag context.\n"
-            "Keep bullet lists as bullet lists.\n"
+            "If a word could be 'handle' vs 'strap', choose based on handbag context.\n"
+            "Keep bullets as bullets; keep line breaks.\n"
         ),
         height=140,
     )
+
+    st.divider()
+    st.subheader("PDF in-place mode")
+    pdf_mode = st.radio(
+        "How to place translations on the same PDF page?",
+        options=["Redact original + place English", "Overlay English only (keeps original visible)"],
+        index=0,
+    )
+    redact_pdf = (pdf_mode == "Redact original + place English")
+
 
 # ---- Upload ----
 uploaded = st.file_uploader(
@@ -126,10 +162,13 @@ if translate_btn and not api_key:
 
 
 def run_translation() -> List[Tuple[str, bytes]]:
-    translator = OpenAITranslator(api_key=api_key, model=model, reasoning_effort=reasoning_effort)
+    translator = OpenAITranslator(
+        api_key=api_key,
+        model=model,
+        reasoning_effort=reasoning_effort,
+    )
 
     outputs: List[Tuple[str, bytes]] = []
-
     overall = st.progress(0)
     overall_status = st.empty()
 
@@ -156,12 +195,13 @@ def run_translation() -> List[Tuple[str, bytes]]:
                         file_progress.progress(1.0)
 
                 out_bytes = translate_pdf_bytes(
-                    raw,
+                    pdf_bytes=raw,
                     translator=translator,
                     source_lang=source_lang,
                     target_lang=target_lang,
                     glossary=glossary,
                     extra_instructions=extra_instructions,
+                    redact_original=redact_pdf,
                     on_progress=on_pdf_progress,
                 )
 
@@ -183,7 +223,7 @@ def run_translation() -> List[Tuple[str, bytes]]:
                     file_progress.progress(slide_1based / total_slides)
 
                 out_bytes = translate_pptx_bytes(
-                    raw,
+                    pptx_bytes=raw,
                     translator=translator,
                     source_lang=source_lang,
                     target_lang=target_lang,
@@ -203,7 +243,6 @@ def run_translation() -> List[Tuple[str, bytes]]:
 
         file_progress.empty()
         file_status.empty()
-
         overall.progress(f_i / len(uploaded))
 
     overall_status.write("Done.")
