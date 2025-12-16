@@ -8,79 +8,15 @@ from pptx import Presentation
 from .openai_translate import OpenAITranslator, TranslationItem
 
 
-def _rewrite_paragraph_keep_first_run(paragraph, new_text: str) -> None:
-    runs = list(paragraph.runs)
-    if not runs:
-        run = paragraph.add_run()
-        run.text = new_text
-        return
-    runs[0].text = new_text
-    for r in runs[1:]:
-        r.text = ""
-
-
-def _collect_slide_items(prs: Presentation, slide_idx: int) -> Tuple[List[TranslationItem], List[Tuple[str, object]]]:
+def replace_text_on_slide(slide, old_text, new_text):
     """
-    Returns:
-      items: list of (id,text) for that slide
-      targets: list of (id, paragraph_obj) so we can rewrite later
+    Replaces old_text with new_text directly on the slide.
     """
-    slide = prs.slides[slide_idx]
-    items: List[TranslationItem] = []
-    targets: List[Tuple[str, object]] = []
-
-    for sh_i, shape in enumerate(slide.shapes):
-        # Tables
-        if hasattr(shape, "has_table") and shape.has_table:
-            table = shape.table
-            for r in range(len(table.rows)):
-                for c in range(len(table.columns)):
-                    cell = table.cell(r, c)
-                    if not cell.text_frame:
-                        continue
-                    for p_i, para in enumerate(cell.text_frame.paragraphs):
-                        txt = para.text.strip()
-                        if not txt:
-                            continue
-                        tid = f"s{slide_idx}_sh{sh_i}_cell{r}_{c}_p{p_i}"
-                        items.append(TranslationItem(id=tid, text=txt))
-                        targets.append((tid, para))
-            continue
-
-        if not getattr(shape, "has_text_frame", False):
-            continue
-        tf = shape.text_frame
-        if tf is None:
-            continue
-        for p_i, para in enumerate(tf.paragraphs):
-            txt = para.text.strip()
-            if not txt:
-                continue
-            tid = f"s{slide_idx}_sh{sh_i}_p{p_i}"
-            items.append(TranslationItem(id=tid, text=txt))
-            targets.append((tid, para))
-
-    return items, targets
-
-
-def _safe_chunk(items: List[TranslationItem], max_chars: int = 18000, max_items: int = 60) -> List[List[TranslationItem]]:
-    batches: List[List[TranslationItem]] = []
-    cur: List[TranslationItem] = []
-    cur_chars = 0
-
-    for it in items:
-        tlen = len(it.text or "")
-        if cur and (len(cur) >= max_items or (cur_chars + tlen) > max_chars):
-            batches.append(cur)
-            cur = []
-            cur_chars = 0
-        cur.append(it)
-        cur_chars += tlen
-
-    if cur:
-        batches.append(cur)
-
-    return batches
+    for shape in slide.shapes:
+        if hasattr(shape, "has_text_frame") and shape.has_text_frame:
+            for para in shape.text_frame.paragraphs:
+                if old_text in para.text:
+                    para.text = para.text.replace(old_text, new_text)
 
 
 def translate_pptx_bytes(
@@ -99,6 +35,7 @@ def translate_pptx_bytes(
         if on_progress:
             on_progress(s_i + 1, total_slides)
 
+        slide = prs.slides[s_i]
         items, targets = _collect_slide_items(prs, s_i)
         if not items:
             continue
@@ -117,7 +54,8 @@ def translate_pptx_bytes(
 
         for tid, para in targets:
             if tid in translations:
-                _rewrite_paragraph_keep_first_run(para, translations[tid])
+                translated_text = translations[tid]
+                replace_text_on_slide(slide, para.text, translated_text)
 
     if on_progress:
         on_progress(total_slides, total_slides)
