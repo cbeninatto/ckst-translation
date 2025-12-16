@@ -1,28 +1,17 @@
 from __future__ import annotations
 
 from io import BytesIO
-from typing import Dict, List
+from typing import Callable, Dict, Optional
 
 import fitz  # PyMuPDF
 
-from .openai_translate import OpenAITranslator, TranslationItem, chunk_items
+from .openai_translate import OpenAITranslator
 
 
-def extract_pdf_page_items(doc: fitz.Document) -> List[TranslationItem]:
-    items: List[TranslationItem] = []
-    for i in range(doc.page_count):
-        page = doc.load_page(i)
-        txt = (page.get_text("text") or "").strip()
-        if not txt:
-            continue
-        items.append(TranslationItem(id=f"p{i}", text=txt))
-    return items
-
-
-def _split_text(text: str, max_chars: int = 3000) -> List[str]:
+def _split_text(text: str, max_chars: int = 3000):
     if len(text) <= max_chars:
         return [text]
-    parts: List[str] = []
+    parts = []
     cur = []
     cur_len = 0
     for para in text.split("\n\n"):
@@ -43,7 +32,6 @@ def _split_text(text: str, max_chars: int = 3000) -> List[str]:
 
 
 def _add_translation_pages(out_doc: fitz.Document, width: float, height: float, title: str, text: str) -> None:
-    # Try to fit in one page by shrinking font a bit; otherwise split into multiple pages.
     rect = fitz.Rect(48, 72, width - 48, height - 48)
     full = f"{title}\n\n{text}".strip()
 
@@ -52,10 +40,8 @@ def _add_translation_pages(out_doc: fitz.Document, width: float, height: float, 
         remaining_area = page.insert_textbox(rect, full, fontsize=fontsize, fontname="helv")
         if remaining_area >= 0:
             return
-        # doesn't fit — remove and try smaller
         out_doc.delete_page(out_doc.page_count - 1)
 
-    # Still doesn't fit: split
     for idx, chunk in enumerate(_split_text(text, max_chars=2600), start=1):
         page = out_doc.new_page(width=width, height=height)
         chunk_title = title if idx == 1 else f"{title} (cont. {idx})"
@@ -69,45 +55,55 @@ def translate_pdf_bytes(
     target_lang: str,
     glossary: Dict[str, str],
     extra_instructions: str,
-    max_chars: int = 18000,
-    max_items: int = 25,
+    on_progress: Optional[Callable[[int, int], None]] = None,  # (page_idx, total_pages)
 ) -> bytes:
     src = fitz.open(stream=pdf_bytes, filetype="pdf")
-    items = extract_pdf_page_items(src)
 
-    # If there's no extractable text, it's likely scanned/image-only.
-    # We still return the original; app will warn the user.
-    if not items:
+    # If there's no extractable text anywhere, return original.
+    any_text = False
+    for i in range(src.page_count):
+        if (src.load_page(i).get_text("text") or "").strip():
+            any_text = True
+            break
+    if not any_text:
         return pdf_bytes
 
-    translations: Dict[str, str] = {}
-    for batch in chunk_items(items, max_chars=max_chars, max_items=max_items):
-        batch_map = translator.translate_batch(
-            batch,
+    out = fitz.open()
+    total = src.page_count
+
+    for i in range(total):
+        if on_progress:
+            on_progress(i, total)
+
+        page = src.load_page(i)
+        original_text = (page.get_text("text") or "").strip()
+
+        # Copy original page first
+        out.insert_pdf(src, from_page=i, to_page=i)
+
+        if not original_text:
+            continue
+
+        translated = translator.translate_text(
+            original_text,
             source_lang=source_lang,
             target_lang=target_lang,
             glossary=glossary,
             extra_instructions=extra_instructions,
         )
-        translations.update(batch_map)
 
-    out = fitz.open()
-    for i in range(src.page_count):
-        # Copy original page
-        out.insert_pdf(src, from_page=i, to_page=i)
+        w = page.rect.width
+        h = page.rect.height
+        _add_translation_pages(
+            out_doc=out,
+            width=w,
+            height=h,
+            title=f"English translation — page {i+1}",
+            text=translated,
+        )
 
-        # Add translation page if we have text
-        tid = f"p{i}"
-        if tid in translations:
-            w = src.load_page(i).rect.width
-            h = src.load_page(i).rect.height
-            _add_translation_pages(
-                out_doc=out,
-                width=w,
-                height=h,
-                title=f"English translation — page {i+1}",
-                text=translations[tid],
-            )
+    if on_progress:
+        on_progress(total, total)
 
     buf = BytesIO()
     out.save(buf)
