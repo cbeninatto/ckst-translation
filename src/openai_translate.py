@@ -38,7 +38,10 @@ class OpenAITranslator:
     def __init__(self, api_key: Optional[str], model: str, reasoning_effort: str = "low"):
         self.client = OpenAI(api_key=api_key) if api_key else OpenAI()
         self.model = model
-        self.reasoning_effort = reasoning_effort  # none|minimal|low|medium|high|xhigh
+        self.reasoning_effort = reasoning_effort
+
+    def _supports_reasoning(self) -> bool:
+        return self.model.startswith("gpt-5") or self.model.startswith("o")
 
     @staticmethod
     def _schema_single():
@@ -86,17 +89,29 @@ class OpenAITranslator:
             s += "\nExtra instructions:\n" + extra.strip() + "\n"
         return s
 
+    def _maybe_reasoning_kwargs(self) -> Dict:
+        if self._supports_reasoning() and self.reasoning_effort and self.reasoning_effort != "none":
+            return {"reasoning": {"effort": self.reasoning_effort}}
+        return {}
+
     @retry(
         reraise=True,
         stop=stop_after_attempt(4),
         wait=wait_exponential(multiplier=1, min=1, max=12),
         retry=retry_if_exception_type(Exception),
     )
-    def translate_text(self, text: str, source_lang: str, target_lang: str, glossary: Dict[str, str], extra_instructions: str = "") -> str:
+    def translate_text(
+        self,
+        text: str,
+        source_lang: str,
+        target_lang: str,
+        glossary: Dict[str, str],
+        extra_instructions: str = "",
+    ) -> str:
         pt = protect_text(text)
         sys = self._system_prompt(source_lang, target_lang, glossary, extra_instructions)
 
-        resp = self.client.responses.create(
+        kwargs = dict(
             model=self.model,
             input=[
                 {"role": "system", "content": sys},
@@ -110,14 +125,14 @@ class OpenAITranslator:
                     "strict": True,
                 }
             },
-            reasoning={"effort": self.reasoning_effort},
             temperature=0,
             store=False,
         )
+        kwargs.update(self._maybe_reasoning_kwargs())
 
+        resp = self.client.responses.create(**kwargs)
         data = json.loads(resp.output_text)
-        out = restore_protected(data["translated"], pt.placeholder_to_original)
-        return out
+        return restore_protected(data["translated"], pt.placeholder_to_original)
 
     @retry(
         reraise=True,
@@ -125,7 +140,14 @@ class OpenAITranslator:
         wait=wait_exponential(multiplier=1, min=1, max=12),
         retry=retry_if_exception_type(Exception),
     )
-    def translate_batch(self, items: List[TranslationItem], source_lang: str, target_lang: str, glossary: Dict[str, str], extra_instructions: str = "") -> Dict[str, str]:
+    def translate_batch(
+        self,
+        items: List[TranslationItem],
+        source_lang: str,
+        target_lang: str,
+        glossary: Dict[str, str],
+        extra_instructions: str = "",
+    ) -> Dict[str, str]:
         protected = {}
         payload = []
         for it in items:
@@ -135,7 +157,7 @@ class OpenAITranslator:
 
         sys = self._system_prompt(source_lang, target_lang, glossary, extra_instructions)
 
-        resp = self.client.responses.create(
+        kwargs = dict(
             model=self.model,
             input=[
                 {"role": "system", "content": sys},
@@ -149,12 +171,14 @@ class OpenAITranslator:
                     "strict": True,
                 }
             },
-            reasoning={"effort": self.reasoning_effort},
             temperature=0,
             store=False,
         )
+        kwargs.update(self._maybe_reasoning_kwargs())
 
+        resp = self.client.responses.create(**kwargs)
         data = json.loads(resp.output_text)
+
         out: Dict[str, str] = {}
         for row in data["translations"]:
             tid = row["id"]
