@@ -125,7 +125,6 @@ class OpenAITranslator:
                     "strict": True,
                 }
             },
-            temperature=0,
             store=False,
         )
         kwargs.update(self._maybe_reasoning_kwargs())
@@ -171,7 +170,6 @@ class OpenAITranslator:
                     "strict": True,
                 }
             },
-            temperature=0,
             store=False,
         )
         kwargs.update(self._maybe_reasoning_kwargs())
