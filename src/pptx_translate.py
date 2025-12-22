@@ -1,100 +1,103 @@
-from __future__ import annotations
-
-from io import BytesIO
-from typing import Callable, Dict, List, Optional, Tuple
+import io
+from typing import Callable, Dict, Optional
 
 from pptx import Presentation
 
 from .openai_translate import OpenAITranslator, TranslationItem, chunk_items
-
-
-def _rewrite_paragraph(paragraph, new_text: str) -> None:
-    runs = list(paragraph.runs)
-    if not runs:
-        paragraph.add_run().text = new_text
-        return
-    runs[0].text = new_text
-    for r in runs[1:]:
-        r.text = ""
-
-
-def _collect_slide_items(prs: Presentation, slide_idx: int) -> Tuple[List[TranslationItem], List[Tuple[str, object]]]:
-    slide = prs.slides[slide_idx]
-    items: List[TranslationItem] = []
-    targets: List[Tuple[str, object]] = []
-
-    for sh_i, shape in enumerate(slide.shapes):
-        # Tables
-        if getattr(shape, "has_table", False):
-            table = shape.table
-            for r in range(len(table.rows)):
-                for c in range(len(table.columns)):
-                    cell = table.cell(r, c)
-                    tf = getattr(cell, "text_frame", None)
-                    if not tf:
-                        continue
-                    for p_i, para in enumerate(tf.paragraphs):
-                        txt = (para.text or "").strip()
-                        if not txt:
-                            continue
-                        tid = f"s{slide_idx}_sh{sh_i}_cell{r}_{c}_p{p_i}"
-                        items.append(TranslationItem(tid, txt))
-                        targets.append((tid, para))
-            continue
-
-        # Text frames
-        if not getattr(shape, "has_text_frame", False):
-            continue
-        tf = shape.text_frame
-        if not tf:
-            continue
-        for p_i, para in enumerate(tf.paragraphs):
-            txt = (para.text or "").strip()
-            if not txt:
-                continue
-            tid = f"s{slide_idx}_sh{sh_i}_p{p_i}"
-            items.append(TranslationItem(tid, txt))
-            targets.append((tid, para))
-
-    return items, targets
+from .text_utils import apply_glossary_hard
 
 
 def translate_pptx_bytes(
     pptx_bytes: bytes,
     translator: OpenAITranslator,
-    source_lang: str,
-    target_lang: str,
-    glossary: Dict[str, str],
-    extra_instructions: str,
-    on_progress: Optional[Callable[[int, int], None]] = None,  # (slide_1based, total)
+    source_lang: str = "pt-BR",
+    target_lang: str = "en",
+    glossary: Optional[Dict[str, str]] = None,
+    extra_instructions: str = "",
+    on_progress: Optional[Callable[[str, int, int], None]] = None,
 ) -> bytes:
-    prs = Presentation(BytesIO(pptx_bytes))
-    total = len(prs.slides)
+    """
+    Translates PPTX text in-place (same slides/shapes).
+    """
+    glossary = glossary or {}
 
-    for s_i in range(total):
+    prs = Presentation(io.BytesIO(pptx_bytes))
+
+    # Collect paragraph-level items
+    items = []
+    ptrs = []  # (item_id, paragraph, sample_run)
+
+    total_slides = len(prs.slides)
+    if on_progress:
+        on_progress("slides", 0, max(1, total_slides))
+
+    for si, slide in enumerate(prs.slides):
         if on_progress:
-            on_progress(s_i + 1, total)
+            on_progress("slides", si + 1, max(1, total_slides))
 
-        items, targets = _collect_slide_items(prs, s_i)
-        if not items:
-            continue
+        for shape_index, shape in enumerate(slide.shapes):
+            if not getattr(shape, "has_text_frame", False):
+                continue
+            tf = shape.text_frame
+            if tf is None:
+                continue
 
-        translations: Dict[str, str] = {}
-        for batch in chunk_items(items):
-            translations.update(
-                translator.translate_batch(
-                    batch,
-                    source_lang=source_lang,
-                    target_lang=target_lang,
-                    glossary=glossary,
-                    extra_instructions=extra_instructions,
-                )
+            for pi, p in enumerate(tf.paragraphs):
+                text = "".join(run.text for run in p.runs) if p.runs else (p.text or "")
+                if not text or not text.strip():
+                    continue
+
+                # skip pure placeholders/codes maybe? (translator protection already helps)
+                item_id = f"s{si}_sh{shape_index}_p{pi}"
+                items.append(TranslationItem(item_id, text))
+                sample_run = p.runs[0] if p.runs else None
+                ptrs.append((item_id, p, sample_run))
+
+    # Translate in large chunks
+    mapping: Dict[str, str] = {}
+    total_items = len(items)
+    done = 0
+    if on_progress:
+        on_progress("text", 0, max(1, total_items))
+
+    for ch in chunk_items(items):
+        mapping.update(
+            translator.translate_batch(
+                ch,
+                source_lang=source_lang,
+                target_lang=target_lang,
+                glossary=glossary,
+                extra_instructions=extra_instructions,
             )
+        )
+        done += len(ch)
+        if on_progress:
+            on_progress("text", min(done, total_items), max(1, total_items))
 
-        for tid, para in targets:
-            if tid in translations:
-                _rewrite_paragraph(para, translations[tid])
+    # Write back
+    for item_id, paragraph, sample_run in ptrs:
+        new_text = mapping.get(item_id, None)
+        if not new_text:
+            continue
+        new_text = apply_glossary_hard(new_text, glossary)
 
-    out = BytesIO()
+        # Preserve style: rewrite paragraph to a single run
+        # This may simplify formatting, but keeps box positioning.
+        # If you need strict per-run formatting, we can do a more advanced run mapping later.
+        paragraph.text = new_text
+        if sample_run is not None and paragraph.runs:
+            r0 = paragraph.runs[0]
+            try:
+                r0.font.name = sample_run.font.name
+                r0.font.size = sample_run.font.size
+                r0.font.bold = sample_run.font.bold
+                r0.font.italic = sample_run.font.italic
+                r0.font.underline = sample_run.font.underline
+                if sample_run.font.color and sample_run.font.color.rgb:
+                    r0.font.color.rgb = sample_run.font.color.rgb
+            except Exception:
+                pass
+
+    out = io.BytesIO()
     prs.save(out)
     return out.getvalue()
