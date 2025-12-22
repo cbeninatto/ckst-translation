@@ -9,7 +9,8 @@ from src.openai_translate import OpenAITranslator
 from src.text_utils import parse_glossary_lines
 from src.pdf_translate import translate_pdf_bytes
 from src.pptx_translate import translate_pptx_bytes
-from src.xlsm_translate import translate_excel_to_xls_bytes
+from src.xlsm_translate import translate_excel_to_xls_bytes  # <-- MUST EXIST
+
 
 st.set_page_config(page_title="CKST Translator", layout="wide")
 
@@ -18,6 +19,7 @@ st.caption("PDF / PPTX / XLSM / XLS — handbag terminology focused")
 
 
 def get_api_key() -> str:
+    # Don't show the key or any "loaded" status anywhere in the UI.
     try:
         v = st.secrets.get("OPENAI_API_KEY", "")
         if v:
@@ -56,7 +58,6 @@ with st.sidebar:
         index=2,
     )
 
-# Do NOT print anything about key being loaded/hidden
 if not api_key:
     st.warning(
         "OpenAI key is not configured.\n\n"
@@ -73,32 +74,24 @@ with colA:
     glossary_text = st.text_area(
         "Glossary (optional) — one per line: `pt => en`",
         value=(
+            "OURO BATIDO => BRUSH GOLD\n"
             "alça => strap\n"
             "alça de ombro => shoulder strap\n"
             "alça transversal => crossbody strap\n"
             "forro => lining\n"
-            "corpo => body\n"
             "ferragem => hardware\n"
             "rebite => rivet\n"
-            "mosquetão => swivel clasp\n"
             "argola => ring\n"
             "meia argola => D-ring\n"
             "zíper => zipper\n"
             "cursor => zipper puller\n"
-            "bolso interno => inner pocket\n"
-            "bolso externo => outer pocket\n"
-            "etiqueta => label\n"
-            "acabamento => finish\n"
-            "costura => stitching\n"
             "pesponto => topstitching\n"
             "reforço => reinforcement\n"
-            "espuma => foam\n"
             "entretela => interlining\n"
             "vivo => piping\n"
             "viés => binding tape\n"
-            "OURO BATIDO => BRUSH GOLD\n"
         ),
-        height=240,
+        height=220,
     )
 
 with colB:
@@ -109,7 +102,7 @@ with colB:
             "Keep measurements, codes, SKUs, and numbers unchanged.\n"
             "Be clear and factory-friendly."
         ),
-        height=240,
+        height=220,
     )
 
 glossary = parse_glossary_lines(glossary_text)
@@ -126,6 +119,7 @@ run = st.button("Translate to English", type="primary", disabled=not (uploaded_f
 
 
 def build_translator():
+    # Keep it tolerant to different OpenAITranslator signatures
     try:
         return OpenAITranslator(api_key=api_key, model=model, reasoning_effort=reasoning_effort)
     except TypeError:
@@ -179,7 +173,8 @@ if run:
         status.info(f"Processing **{filename}** ({idx}/{total_files})")
 
         main_bar = st.progress(0.0, text="starting…")
-        sub_ph = st.empty()
+        sub_bar = st.progress(0.0, text="")
+        sub_visible = False
 
         def on_progress_generic(label: str, done: int, total: int):
             total = max(1, int(total))
@@ -188,14 +183,16 @@ if run:
             main_bar.progress(pct, text=f"{label} ({done}/{total})")
 
         def on_progress_excel(label: str, done: int, total: int):
+            nonlocal sub_visible
             total = max(1, int(total))
             done = max(0, int(done))
             pct = min(1.0, done / total)
 
             if label in ("pages", "sheets", "tabs"):
                 main_bar.progress(pct, text=f"pages ({done}/{total})")
-            elif label in ("batches", "cells"):
-                sub_ph.progress(pct, text=f"batches ({done}/{total})")
+            elif label in ("batches",):
+                sub_visible = True
+                sub_bar.progress(pct, text=f"batches ({done}/{total})")
             else:
                 main_bar.progress(pct, text=f"{label} ({done}/{total})")
 
@@ -212,7 +209,7 @@ if run:
 
             elif ext in ("xlsm", "xls"):
                 out_bytes = translate_excel_to_xls_bytes(
-                    data,
+                    excel_bytes=data,
                     input_ext=ext,
                     translator=translator,
                     source_lang="pt-BR",
@@ -224,7 +221,6 @@ if run:
                 )
                 out_name = filename.rsplit(".", 1)[0] + "_EN.xls"
                 mime = "application/vnd.ms-excel"
-                sub_ph.empty()
 
             else:
                 raise ValueError(f"Unsupported file type: {ext}")
