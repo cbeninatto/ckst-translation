@@ -59,7 +59,7 @@ with st.sidebar:
         help="If the selected model rejects reasoning controls, set to 'none'.",
     )
 
-# IMPORTANT: no message that mentions key presence/absence in sidebar
+# IMPORTANT: do not print anything like “OPENAI_API_KEY loaded (hidden)”
 if not api_key:
     st.warning(
         "OpenAI key is not configured.\n\n"
@@ -128,7 +128,6 @@ run = st.button("Translate to English", type="primary", disabled=not (uploaded_f
 
 
 def build_translator():
-    # Keep construction tolerant if your OpenAITranslator signature changes
     try:
         return OpenAITranslator(api_key=api_key, model=model, reasoning_effort=reasoning_effort)
     except TypeError:
@@ -141,9 +140,6 @@ def build_translator():
 
 
 def call_translate(func, data: bytes, translator, on_progress):
-    """
-    Call PDF/PPTX translators with the canonical signature, with fallbacks.
-    """
     attempts = [
         lambda: func(
             data,
@@ -182,29 +178,45 @@ if run:
         ext = filename.split(".")[-1].lower()
         data = uf.read()
 
-        # This line keeps filename visible, progress bar text stays clean
         status.info(f"Processing **{filename}** ({idx}/{total_files})")
 
-        per_file = st.progress(0.0, text="preparing...")
-        per_label = st.empty()
+        # Main per-file bar (we'll show "pages" for XLSM, normal labels for others)
+        main_bar = st.progress(0.0, text="starting...")
+        # Secondary bar only for XLSM (cells/batches)
+        sub_ph = st.empty()
 
-        def on_progress(label: str, done: int, total: int):
+        def on_progress_generic(label: str, done: int, total: int):
+            total = max(1, int(total))
+            done = max(0, int(done))
+            pct = min(1.0, done / total)
+            main_bar.progress(pct, text=f"{label} ({done}/{total})")
+
+        def on_progress_xlsm(label: str, done: int, total: int):
+            """
+            XLSM uses two progress indicators:
+              - label 'pages' (tabs) -> main_bar
+              - label 'batches' -> sub bar
+            """
             total = max(1, int(total))
             done = max(0, int(done))
             pct = min(1.0, done / total)
 
-            # NOTE: No filename prefix here (fixes your #2 expectation)
-            per_file.progress(pct, text=f"{label} ({done}/{total})")
-            per_label.caption(f"{label} ({done}/{total})")
+            if label in ("pages", "sheets", "tabs"):
+                main_bar.progress(pct, text=f"pages ({done}/{total})")
+            elif label in ("batches", "cells"):
+                # create/refresh sub progress bar
+                pb = sub_ph.progress(pct, text=f"cells ({done}/{total})")
+            else:
+                main_bar.progress(pct, text=f"{label} ({done}/{total})")
 
         try:
             if ext == "pdf":
-                out_bytes = call_translate(translate_pdf_bytes, data, translator, on_progress)
+                out_bytes = call_translate(translate_pdf_bytes, data, translator, on_progress_generic)
                 out_name = filename[:-4] + "_EN.pdf"
                 mime = "application/pdf"
 
             elif ext == "pptx":
-                out_bytes = call_translate(translate_pptx_bytes, data, translator, on_progress)
+                out_bytes = call_translate(translate_pptx_bytes, data, translator, on_progress_generic)
                 out_name = filename[:-5] + "_EN.pptx"
                 mime = "application/vnd.openxmlformats-officedocument.presentationml.presentation"
 
@@ -216,10 +228,13 @@ if run:
                     target_lang="en",
                     glossary=glossary,
                     extra_instructions=extra_instructions,
-                    on_progress=on_progress,
+                    on_progress=on_progress_xlsm,
                 )
                 out_name = filename[:-5] + "_EN.xlsm"
                 mime = "application/vnd.ms-excel.sheet.macroEnabled.12"
+
+                # Remove the sub bar after finishing
+                sub_ph.empty()
 
             else:
                 raise ValueError(f"Unsupported file type: {ext}")
