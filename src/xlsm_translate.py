@@ -1,128 +1,272 @@
 import io
-from typing import Callable, Dict, List, Optional, Tuple
+import os
+import zipfile
+from datetime import datetime
 
-import openpyxl
-from openpyxl.utils import get_column_letter
-from openpyxl.worksheet.cell_range import CellRange
+import streamlit as st
 
-from .openai_translate import OpenAITranslator, TranslationItem, chunk_items
+from src.openai_translate import OpenAITranslator
+from src.pdf_translate import translate_pdf_bytes
+from src.pptx_translate import translate_pptx_bytes
+from src.xlsm_translate import translate_xlsm_bytes
+from src.text_utils import parse_glossary_lines
+
+st.set_page_config(page_title="CKST Translator", layout="wide")
+
+st.title("CKST Techpack Translator (PT-BR ➜ EN)")
+st.caption("PDF / PPTX / XLSM — handbag terminology focused")
 
 
-def _compute_area_bounds(ws) -> Tuple[int, int, int, int, List[CellRange]]:
+# -----------------------------
+# API key: load ONLY from secrets/env (never display)
+# -----------------------------
+def get_api_key() -> str:
+    try:
+        v = st.secrets.get("OPENAI_API_KEY", "")
+        if v:
+            return str(v)
+    except Exception:
+        pass
+    return os.getenv("OPENAI_API_KEY", "") or ""
+
+
+api_key = get_api_key()
+
+
+# -----------------------------
+# Sidebar (NO API KEY status text)
+# -----------------------------
+with st.sidebar:
+    st.header("OpenAI")
+
+    model = st.selectbox(
+        "Model",
+        options=[
+            "gpt-5.2-pro",
+            "gpt-5.2",
+            "gpt-5.1",
+            "gpt-5",
+            "gpt-5-mini",
+            "gpt-5-nano",
+            "gpt-4.1",
+            "gpt-4.1-mini",
+            "gpt-4.1-nano",
+            "gpt-4o",
+            "o4-mini",
+        ],
+        index=0,
+    )
+
+    reasoning_effort = st.selectbox(
+        "Reasoning effort (if supported)",
+        options=["none", "low", "medium", "high", "xhigh"],
+        index=2,
+        help="If your translator/model rejects this, set to 'none'.",
+    )
+
+    with st.expander("Setup / Diagnostics", expanded=False):
+        st.write(
+            "To set your API key without showing it:\n\n"
+            "- **Streamlit Cloud**: Secrets → `OPENAI_API_KEY = \"...\"`\n"
+            "- **Local**: set environment variable `OPENAI_API_KEY`\n"
+        )
+        st.code("OPENAI_API_KEY=" + ("(set)" if bool(api_key) else "(not set)"), language="text")
+
+st.divider()
+
+
+# -----------------------------
+# Glossary + instructions
+# -----------------------------
+colA, colB = st.columns([1, 1])
+
+with colA:
+    glossary_text = st.text_area(
+        "Glossary (optional) — one per line: `pt => en`",
+        value=(
+            "alça => strap\n"
+            "alça de ombro => shoulder strap\n"
+            "alça transversal => crossbody strap\n"
+            "forro => lining\n"
+            "corpo => body\n"
+            "ferragem => hardware\n"
+            "rebite => rivet\n"
+            "mosquetão => swivel clasp\n"
+            "argola => ring\n"
+            "meia argola => D-ring\n"
+            "zíper => zipper\n"
+            "cursor => zipper puller\n"
+            "bolso interno => inner pocket\n"
+            "bolso externo => outer pocket\n"
+            "etiqueta => label\n"
+            "acabamento => finish\n"
+            "costura => stitching\n"
+            "pesponto => topstitching\n"
+            "reforço => reinforcement\n"
+            "espuma => foam\n"
+            "entretela => interlining\n"
+            "vivo => piping\n"
+            "viés => binding tape\n"
+        ),
+        height=220,
+    )
+
+with colB:
+    extra_instructions = st.text_area(
+        "Extra instructions (optional)",
+        value=(
+            "Use handbag / softgoods manufacturing terminology.\n"
+            "Keep measurements, codes, SKUs, and numbers unchanged.\n"
+            "Keep the structure and be factory-friendly."
+        ),
+        height=220,
+    )
+
+glossary = parse_glossary_lines(glossary_text)
+
+st.divider()
+
+
+# -----------------------------
+# Upload
+# -----------------------------
+uploaded_files = st.file_uploader(
+    "Upload your files",
+    type=["pdf", "pptx", "xlsm"],
+    accept_multiple_files=True,
+)
+
+run = st.button(
+    "Translate to English",
+    type="primary",
+    disabled=not (uploaded_files and api_key),
+)
+
+
+# -----------------------------
+# Helpers
+# -----------------------------
+def build_translator():
+    # Try the most feature-complete signature first
+    try:
+        return OpenAITranslator(api_key=api_key, model=model, reasoning_effort=reasoning_effort)
+    except TypeError:
+        pass
+    # Try without reasoning_effort
+    try:
+        return OpenAITranslator(api_key=api_key, model=model)
+    except TypeError:
+        pass
+    # Positional fallback
+    return OpenAITranslator(api_key, model)
+
+
+def call_translate(func, data: bytes, translator, on_progress):
     """
-    Returns (min_row, min_col, max_row, max_col, ranges)
-    - If print_area exists, use it (can be multiple ranges).
-    - Otherwise fallback to "used" bounds based on non-empty values.
+    Tolerant wrapper for your existing PDF/PPTX translate functions.
     """
-    pa = getattr(ws, "print_area", None)
-    if pa:
-        pa = pa.strip()
-    if pa:
-        parts = [p.strip() for p in pa.split(",") if p.strip()]
-        ranges: List[CellRange] = []
-        for p in parts:
-            if "!" in p:
-                p = p.split("!", 1)[1]
-            p = p.replace("$", "")
-            ranges.append(CellRange(p))
-        min_row = min(r.min_row for r in ranges)
-        min_col = min(r.min_col for r in ranges)
-        max_row = max(r.max_row for r in ranges)
-        max_col = max(r.max_col for r in ranges)
-        return min_row, min_col, max_row, max_col, ranges
-
-    min_row = min_col = None
-    max_row = max_col = 0
-    for row in ws.iter_rows():
-        for cell in row:
-            v = cell.value
-            if v is None:
-                continue
-            if isinstance(v, str) and not v.strip():
-                continue
-            r = cell.row
-            c = cell.column
-            min_row = r if min_row is None else min(min_row, r)
-            min_col = c if min_col is None else min(min_col, c)
-            max_row = max(max_row, r)
-            max_col = max(max_col, c)
-
-    if min_row is None:
-        min_row = min_col = 1
-        max_row = max_col = 1
-
-    return min_row, min_col, max_row, max_col, [
-        CellRange(min_col=min_col, min_row=min_row, max_col=max_col, max_row=max_row)
+    attempts = [
+        lambda: func(
+            data,
+            translator,
+            on_progress=on_progress,
+            source_lang="pt-BR",
+            target_lang="en",
+            glossary=glossary,
+            extra_instructions=extra_instructions,
+        ),
+        lambda: func(data, translator, on_progress=on_progress, glossary=glossary, extra_instructions=extra_instructions),
+        lambda: func(data, translator, glossary=glossary, extra_instructions=extra_instructions),
+        lambda: func(data, translator, on_progress=on_progress),
+        lambda: func(data, translator),
+        lambda: func(data),
     ]
+    last_err = None
+    for a in attempts:
+        try:
+            return a()
+        except TypeError as e:
+            last_err = e
+    raise last_err
 
 
-def translate_xlsm_bytes(
-    xlsm_bytes: bytes,
-    translator: OpenAITranslator,
-    on_progress: Optional[Callable[[str, int, int], None]] = None,
-) -> bytes:
-    """
-    Translates all worksheets.
-    Only the defined print area is kept; everything outside is removed:
-    - clear cells outside print area (within bounds)
-    - delete rows/cols after the print area (safe, no shifting inside)
-    - keep macros (keep_vba=True)
-    """
-    wb = openpyxl.load_workbook(io.BytesIO(xlsm_bytes), keep_vba=True, data_only=False)
+# -----------------------------
+# Run
+# -----------------------------
+if run:
+    if not api_key:
+        st.error("OPENAI_API_KEY is not set. Open 'Setup / Diagnostics' in the sidebar to configure it.")
+        st.stop()
 
-    sheets = wb.worksheets
-    total_sheets = len(sheets)
+    translator = build_translator()
 
-    for s_idx, ws in enumerate(sheets, start=1):
-        if on_progress:
-            on_progress("sheet", s_idx, total_sheets)
+    results = []
+    overall = st.progress(0.0, text="Starting...")
+    status = st.empty()
 
-        min_row, min_col, max_row, max_col, ranges = _compute_area_bounds(ws)
+    total_files = len(uploaded_files)
 
-        allow = set()
-        for cr in ranges:
-            for r in range(cr.min_row, cr.max_row + 1):
-                for c in range(cr.min_col, cr.max_col + 1):
-                    allow.add((r, c))
+    for idx, uf in enumerate(uploaded_files, start=1):
+        filename = uf.name
+        ext = filename.split(".")[-1].lower()
+        data = uf.read()
 
-        items: List[TranslationItem] = []
-        cell_refs: List[Tuple[int, int, str]] = []
-        for r in range(min_row, max_row + 1):
-            for c in range(min_col, max_col + 1):
-                if (r, c) not in allow:
-                    continue
-                cell = ws.cell(row=r, column=c)
-                v = cell.value
-                if not isinstance(v, str):
-                    continue
-                if not v.strip():
-                    continue
-                if v.strip().startswith("="):  # formula text
-                    continue
-                item_id = f"ws{s_idx}_{cell.coordinate}"
-                items.append(TranslationItem(item_id, v))
-                cell_refs.append((r, c, item_id))
+        status.info(f"Processing **{filename}** ({idx}/{total_files})")
 
-        mapping: Dict[str, str] = {}
-        for chunk in chunk_items(items, max_items=80, max_chars=11000):
-            mapping.update(translator.translate_batch(chunk))
+        per_file = st.progress(0.0, text=f"{filename}: preparing...")
+        per_label = st.empty()
 
-        for r, c, item_id in cell_refs:
-            ws.cell(row=r, column=c).value = mapping.get(item_id, ws.cell(row=r, column=c).value)
+        def on_progress(label: str, done: int, total: int):
+            total = max(1, int(total))
+            done = max(0, int(done))
+            pct = min(1.0, done / total)
+            per_file.progress(pct, text=f"{filename}: {label} ({done}/{total})")
+            per_label.caption(f"{filename}: {label} ({done}/{total})")
 
-        for r in range(min_row, max_row + 1):
-            for c in range(min_col, max_col + 1):
-                if (r, c) in allow:
-                    continue
-                ws.cell(row=r, column=c).value = None
+        try:
+            if ext == "pdf":
+                out_bytes = call_translate(translate_pdf_bytes, data, translator, on_progress)
+                out_name = filename[:-4] + "_EN.pdf"
+                mime = "application/pdf"
 
-        if ws.max_column > max_col:
-            ws.delete_cols(max_col + 1, ws.max_column - max_col)
-        if ws.max_row > max_row:
-            ws.delete_rows(max_row + 1, ws.max_row - max_row)
+            elif ext == "pptx":
+                out_bytes = call_translate(translate_pptx_bytes, data, translator, on_progress)
+                out_name = filename[:-5] + "_EN.pptx"
+                mime = "application/vnd.openxmlformats-officedocument.presentationml.presentation"
 
-        ws.print_area = f"{get_column_letter(min_col)}{min_row}:{get_column_letter(max_col)}{max_row}"
+            elif ext == "xlsm":
+                # ✅ IMPORTANT: call directly so we never hit the generic wrapper path
+                out_bytes = translate_xlsm_bytes(data, translator, on_progress=on_progress)
+                out_name = filename[:-5] + "_EN.xlsm"
+                mime = "application/vnd.ms-excel.sheet.macroEnabled.12"
 
-    out = io.BytesIO()
-    wb.save(out)
-    return out.getvalue()
+            else:
+                raise ValueError(f"Unsupported file type: {ext}")
+
+            results.append((out_name, out_bytes, mime))
+            st.success(f"✅ Done: {out_name}")
+            st.download_button(
+                label=f"Download {out_name}",
+                data=out_bytes,
+                file_name=out_name,
+                mime=mime,
+            )
+
+        except Exception as e:
+            st.error(f"❌ Error translating {filename}: {e}")
+
+        overall.progress(idx / total_files, text=f"Processed {idx}/{total_files} file(s)")
+
+    if results:
+        zbuf = io.BytesIO()
+        with zipfile.ZipFile(zbuf, "w", zipfile.ZIP_DEFLATED) as zf:
+            for out_name, out_bytes, _ in results:
+                zf.writestr(out_name, out_bytes)
+
+        zip_name = f"translations_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip"
+        st.download_button(
+            "Download ALL as ZIP",
+            data=zbuf.getvalue(),
+            file_name=zip_name,
+            mime="application/zip",
+        )
