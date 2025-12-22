@@ -1,97 +1,119 @@
-import io
-from typing import Callable, List, NamedTuple, Optional
+from __future__ import annotations
+
+from io import BytesIO
+from statistics import median
+from typing import Callable, Dict, Optional, List, Tuple
 
 import fitz  # PyMuPDF
 
-from .openai_translate import OpenAITranslator, TranslationItem, chunk_items
+from .openai_translate import OpenAITranslator
 
 
-class PdfLineItem(NamedTuple):
-    item_id: str
-    text: str
-    rect: fitz.Rect
-    font_size: float
+def _has_letters(s: str) -> bool:
+    return any(ch.isalpha() for ch in (s or ""))
 
 
-def _extract_line_items(page: fitz.Page) -> List[PdfLineItem]:
-    d = page.get_text("dict")
-    items: List[PdfLineItem] = []
-    line_idx = 0
-
-    for block in d.get("blocks", []):
-        if block.get("type") != 0:
-            continue
-        for line in block.get("lines", []):
-            spans = line.get("spans", [])
-            if not spans:
-                continue
-
-            text = "".join([s.get("text", "") for s in spans]).strip()
-            if not text or len(text) <= 1:
-                continue
-
-            rect = None
-            sizes = []
-            for s in spans:
-                bbox = s.get("bbox", None)
-                if bbox:
-                    r = fitz.Rect(bbox)
-                    rect = r if rect is None else rect | r
-                if "size" in s:
-                    sizes.append(float(s["size"]))
-
-            if rect is None:
-                continue
-
-            font_size = max(sizes) if sizes else 10.0
-            item_id = f"p{page.number}_l{line_idx}"
-            items.append(PdfLineItem(item_id=item_id, text=text, rect=rect, font_size=font_size))
-            line_idx += 1
-
-    return items
+def _block_fontsize(block) -> float:
+    sizes = []
+    for line in block.get("lines", []):
+        for span in line.get("spans", []):
+            if "size" in span:
+                sizes.append(float(span["size"]))
+    if not sizes:
+        return 10.0
+    return float(median(sizes))
 
 
-def _insert_translation(page: fitz.Page, rect: fitz.Rect, text: str, font_size: float) -> None:
-    fs = max(4.0, float(font_size))
-    for _ in range(14):
-        rc = page.insert_textbox(rect, text, fontsize=fs, fontname="helv", align=0)
-        if isinstance(rc, (int, float)) and rc >= 0:
+def _block_text(block) -> str:
+    lines = []
+    for line in block.get("lines", []):
+        parts = [span.get("text", "") for span in line.get("spans", [])]
+        line_text = "".join(parts).strip()
+        if line_text:
+            lines.append(line_text)
+    return "\n".join(lines).strip()
+
+
+def _insert_fit_text(page: fitz.Page, rect: fitz.Rect, text: str, base_size: float) -> None:
+    size = max(6.0, min(14.0, base_size))
+    for _ in range(12):
+        remaining = page.insert_textbox(rect, text, fontsize=size, fontname="helv")
+        if remaining >= 0:
             return
-        fs = max(4.0, fs - 0.5)
-    page.insert_textbox(rect, text, fontsize=4.0, fontname="helv", align=0)
+        size -= 0.7
+        if size < 5.5:
+            break
+    page.insert_textbox(rect, text, fontsize=6.0, fontname="helv")
 
 
 def translate_pdf_bytes(
     pdf_bytes: bytes,
     translator: OpenAITranslator,
-    on_progress: Optional[Callable[[str, int, int], None]] = None,
+    source_lang: str,
+    target_lang: str,
+    glossary: Dict[str, str],
+    extra_instructions: str,
+    redact_original: bool = True,
+    on_progress: Optional[Callable[[int, int], None]] = None,  # (page_idx, total_pages)
 ) -> bytes:
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-    total_pages = doc.page_count
+    total = doc.page_count
 
-    for page_idx in range(total_pages):
-        page = doc.load_page(page_idx)
+    # quick check for text-based PDF
+    any_text = False
+    for i in range(total):
+        if (doc.load_page(i).get_text("text") or "").strip():
+            any_text = True
+            break
+    if not any_text:
+        return pdf_bytes
+
+    for i in range(total):
         if on_progress:
-            on_progress("page", page_idx + 1, total_pages)
+            on_progress(i, total)
 
-        items = _extract_line_items(page)
-        if not items:
+        page = doc.load_page(i)
+        d = page.get_text("dict")
+
+        blocks = [b for b in d.get("blocks", []) if b.get("type", 1) == 0]
+        if not blocks:
             continue
 
-        t_items = [TranslationItem(it.item_id, it.text) for it in items]
-        mapping = {}
-        for chunk in chunk_items(t_items, max_items=45, max_chars=7000):
-            mapping.update(translator.translate_batch(chunk))
+        to_place: List[Tuple[fitz.Rect, str, float]] = []
 
-        for it in items:
-            page.add_redact_annot(it.rect, fill=(1, 1, 1))
-        page.apply_redactions(images=fitz.PDF_REDACT_IMAGE_NONE)
+        for b in blocks:
+            txt = _block_text(b)
+            if not txt or not _has_letters(txt):
+                continue
 
-        for it in items:
-            translated = mapping.get(it.item_id, it.text)
-            _insert_translation(page, it.rect, translated, it.font_size)
+            translated = translator.translate_text(
+                txt,
+                source_lang=source_lang,
+                target_lang=target_lang,
+                glossary=glossary,
+                extra_instructions=extra_instructions,
+            )
 
-    out = io.BytesIO()
+            bbox = b.get("bbox")
+            if not bbox:
+                continue
+            rect = fitz.Rect(bbox)
+
+            base_size = _block_fontsize(b)
+            to_place.append((rect, translated, base_size))
+
+            if redact_original:
+                page.add_redact_annot(rect, fill=(1, 1, 1))
+
+        if redact_original:
+            page.apply_redactions()
+
+        for rect, translated, base_size in to_place:
+            _insert_fit_text(page, rect, translated, base_size)
+
+    if on_progress:
+        on_progress(total, total)
+
+    out = BytesIO()
     doc.save(out)
-    doc.close()
     return out.getvalue()
