@@ -99,6 +99,7 @@ with colA:
             "entretela => interlining\n"
             "vivo => piping\n"
             "viés => binding tape\n"
+            "ouro batido => brushed gold\n"
         ),
         height=220,
     )
