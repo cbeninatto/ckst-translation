@@ -1,4 +1,5 @@
 import io
+import re
 from typing import Callable, Dict, List, Optional, Tuple
 
 import openpyxl
@@ -7,6 +8,14 @@ from openpyxl.worksheet.cell_range import CellRange
 
 from .openai_translate import OpenAITranslator, TranslationItem
 from .text_utils import apply_glossary_hard
+
+
+def _norm(s: str) -> str:
+    """Uppercase, collapse spaces, strip trailing punctuation."""
+    s = (s or "").replace("\u00A0", " ").strip().upper()
+    s = re.sub(r"\s+", " ", s)
+    s = s.rstrip(" .:;,-")
+    return s
 
 
 def _parse_print_area(print_area: str) -> List[CellRange]:
@@ -59,22 +68,26 @@ def _unmerge_outside_union(ws, min_row: int, max_row: int, min_col: int, max_col
 
 
 def _crop_sheet_to_union(ws, min_row: int, max_row: int, min_col: int, max_col: int) -> None:
+    # Delete rows below then above
     if ws.max_row > max_row:
         ws.delete_rows(max_row + 1, ws.max_row - max_row)
     if min_row > 1:
         ws.delete_rows(1, min_row - 1)
 
+    # Delete cols right then left
     if ws.max_column > max_col:
         ws.delete_cols(max_col + 1, ws.max_column - max_col)
     if min_col > 1:
         ws.delete_cols(1, min_col - 1)
 
+    # Reset print titles
     try:
         ws.print_title_rows = None
         ws.print_title_cols = None
     except Exception:
         pass
 
+    # Reset print area to the remaining bounds
     try:
         last_col = get_column_letter(ws.max_column if ws.max_column >= 1 else 1)
         last_row = ws.max_row if ws.max_row >= 1 else 1
@@ -89,6 +102,36 @@ def _chunk_list(items: List[TranslationItem], chunk_size: int) -> List[List[Tran
     return [items[i : i + chunk_size] for i in range(0, len(items), chunk_size)]
 
 
+def _find_afio_headers(ws, ranges: List[CellRange]) -> List[Tuple[int, int]]:
+    """
+    Find cells that equal 'AFIO' (normalized), preferably in column G (7).
+    Returns list of (row, col).
+    """
+    found: List[Tuple[int, int]] = []
+    found_col7: List[Tuple[int, int]] = []
+
+    for cr in ranges:
+        for row in ws.iter_rows(min_row=cr.min_row, max_row=cr.max_row, min_col=cr.min_col, max_col=cr.max_col):
+            for cell in row:
+                if isinstance(cell.value, str) and _norm(cell.value) == "AFIO":
+                    found.append((cell.row, cell.column))
+                    if cell.column == 7:
+                        found_col7.append((cell.row, cell.column))
+
+    return found_col7 if found_col7 else found
+
+
+def _under_any_afio_header(r: int, c: int, headers: List[Tuple[int, int]]) -> bool:
+    """
+    True if this cell is in the same column as an AFIO header and below it.
+    If multiple headers exist in the same column, we treat any row below at least one header as "under AFIO".
+    """
+    for hr, hc in headers:
+        if c == hc and r > hr:
+            return True
+    return False
+
+
 def translate_xlsm_bytes(
     xlsm_bytes: bytes,
     translator: OpenAITranslator,
@@ -97,8 +140,18 @@ def translate_xlsm_bytes(
     glossary: Optional[Dict[str, str]] = None,
     extra_instructions: str = "",
     on_progress: Optional[Callable[[str, int, int], None]] = None,
-    batch_size: int = 25,  # smaller batches -> smoother progress
+    batch_size: int = 25,  # smaller -> smoother progress
 ) -> bytes:
+    """
+    XLSM translator:
+    - Uses each worksheet's defined PRINT AREA (strict).
+    - Translates text ONLY inside PRINT AREA.
+    - Crops each sheet by deleting rows/cols outside the print-area UNION.
+    - Special rule:
+        In the AFIO column (typically col G), if the cell under AFIO is "NA COR",
+        replace it with the value from column C of the same row (post-translation).
+        If it's anything else, translate normally.
+    """
     glossary = glossary or {}
 
     wb = openpyxl.load_workbook(io.BytesIO(xlsm_bytes), keep_vba=True, data_only=False)
@@ -109,7 +162,6 @@ def translate_xlsm_bytes(
         on_progress("pages", 0, total_sheets)
 
     for s_idx, ws in enumerate(sheets, start=1):
-        # Page/tab progress (this is what you asked to see)
         if on_progress:
             on_progress("pages", s_idx, total_sheets)
 
@@ -119,6 +171,12 @@ def translate_xlsm_bytes(
 
         min_row, max_row, min_col, max_col = _union_bounds(ranges)
         _unmerge_outside_union(ws, min_row, max_row, min_col, max_col)
+
+        # Detect AFIO header(s)
+        afio_headers = _find_afio_headers(ws, ranges)
+
+        # Track AFIO cells that are "NA COR" -> should copy column C value later
+        na_cor_rows_for_afio: List[Tuple[int, int]] = []  # list of (row, col_of_afio)
 
         items: List[TranslationItem] = []
         coords: List[Tuple[str, int, int]] = []
@@ -134,26 +192,35 @@ def translate_xlsm_bytes(
                     v = cell.value
                     if not isinstance(v, str):
                         continue
-                    txt = v.strip()
+
+                    raw = v
+                    txt = raw.strip()
                     if not txt:
                         continue
+
+                    # Skip formulas
                     if cell.data_type == "f" or txt.startswith("="):
                         continue
 
+                    # SPECIAL RULE: AFIO column under AFIO header
+                    if afio_headers and _under_any_afio_header(cell.row, cell.column, afio_headers):
+                        if _norm(raw) == "NA COR":
+                            # Do NOT translate this cell; later replace with column C (same row)
+                            na_cor_rows_for_afio.append((cell.row, cell.column))
+                            continue
+
                     item_id = f"{ws.title}!{cell.coordinate}"
-                    items.append(TranslationItem(item_id, v))
+                    items.append(TranslationItem(item_id, raw))
                     coords.append((item_id, cell.row, cell.column))
 
         batches = _chunk_list(items, batch_size)
         num_batches = max(1, len(batches))
 
-        # This makes the bar advance steadily even during long workbooks
         if on_progress:
             on_progress("batches", 0, num_batches)
 
         mapping: Dict[str, str] = {}
         for b_idx, batch in enumerate(batches, start=1):
-            # update BEFORE call (so it doesn’t sit forever at 0)
             if on_progress:
                 on_progress("batches", b_idx - 1, num_batches)
 
@@ -170,13 +237,23 @@ def translate_xlsm_bytes(
             if on_progress:
                 on_progress("batches", b_idx, num_batches)
 
-        # Write back translations
+        # Write translations back
         for item_id, r, c in coords:
             new_text = mapping.get(item_id)
             if isinstance(new_text, str):
                 ws.cell(row=r, column=c).value = apply_glossary_hard(new_text, glossary)
 
-        # Clear cells inside union but outside actual print-area blocks
+        # Apply AFIO "NA COR" replacement using column C (post-translation)
+        # Column C = 3
+        for r, afio_col in na_cor_rows_for_afio:
+            src_val = ws.cell(row=r, column=3).value
+            if src_val is None:
+                ws.cell(row=r, column=afio_col).value = ""
+            else:
+                # Copy as-is (it should already be translated if it was a string)
+                ws.cell(row=r, column=afio_col).value = src_val
+
+        # Clear any cells inside union but outside actual print-area blocks
         for r in range(min_row, max_row + 1):
             for c in range(min_col, max_col + 1):
                 if not _cell_in_ranges(r, c, ranges):
