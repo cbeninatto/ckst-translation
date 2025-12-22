@@ -1,67 +1,91 @@
-from __future__ import annotations
-
 import re
-from typing import Dict, NamedTuple
+from typing import Dict, List, NamedTuple, Tuple
 
 
 class ProtectedText(NamedTuple):
-    text: str
-    placeholder_to_original: Dict[str, str]
+    original_text: str
+    protected_text: str
+    placeholder_map: Dict[str, str]
+
+
+def _make_placeholder(i: int) -> str:
+    return f"<<KEEP_{i}>>"
 
 
 _PROTECT_PATTERNS = [
-    r"\bC\d{5}\s?\d{4}\s?\d{4}\s?[A-Z]?\b",
-    r"\b[A-Z]{2,6}\s?\d{2,6}(?:[\s\-]?\d{2,6}){1,4}\b",
-    r"\b\d+(?:[.,]\d+)?\s?(?:mm|cm|m|kg|g|%|pcs|pc|un)\b",
-    r"\bPANTONE\s*[A-Z0-9\- ]+\b",
-    r"\b#[0-9A-Fa-f]{6}\b",
-    r"\b\d+(?:[.,]\d+)?\b",
+    r"\bhttps?://\S+\b",
+    r"\b[\w\.-]+@[\w\.-]+\.\w+\b",
+    r"\b\d+([.,]\d+)?\s*%\b",
+    r"\b\d+([.,]\d+)?\s*(mm|cm|m|kg|g|oz|lb|pcs|pc|un|und|u)\b",
+    r"\b\d+([.,]\d+)?\s*[xX×]\s*\d+([.,]\d+)?(\s*[xX×]\s*\d+([.,]\d+)?)?\s*(mm|cm|m)?\b",
+    r"\b[A-Z0-9]{6,}\b",  # long codes / SKUs / barcodes
 ]
 
 
 def protect_text(text: str) -> ProtectedText:
-    placeholder_to_original: Dict[str, str] = {}
-    out = text
+    if text is None:
+        text = ""
+    s = str(text)
 
-    matches = []
+    placeholder_map: Dict[str, str] = {}
+    idx = 0
+
+    matches: List[Tuple[int, int, str]] = []
     for pat in _PROTECT_PATTERNS:
-        for m in re.finditer(pat, out):
+        for m in re.finditer(pat, s):
             matches.append((m.start(), m.end(), m.group(0)))
+
+    for m in re.finditer(r"\bC\d{5}\s\d{4}\s\d{4}\b", s):
+        matches.append((m.start(), m.end(), m.group(0)))
+
     matches.sort(key=lambda x: (x[0], -(x[1] - x[0])))
 
-    used = [False] * (len(out) + 1)
-    kept = []
-    for s, e, val in matches:
-        if any(used[s:e]):
-            continue
-        for i in range(s, e):
-            used[i] = True
-        kept.append((s, e, val))
+    filtered: List[Tuple[int, int, str]] = []
+    last_end = -1
+    for start, end, val in matches:
+        if start >= last_end:
+            filtered.append((start, end, val))
+            last_end = end
 
-    for idx, (s, e, val) in enumerate(reversed(kept)):
-        ph = f"<KEEP_{idx}>"
-        placeholder_to_original[ph] = val
-        out = out[:s] + ph + out[e:]
+    out = s
+    for start, end, val in sorted(filtered, key=lambda x: x[0], reverse=True):
+        ph = _make_placeholder(idx)
+        idx += 1
+        placeholder_map[ph] = val
+        out = out[:start] + ph + out[end:]
 
-    return ProtectedText(out, placeholder_to_original)
+    return ProtectedText(original_text=s, protected_text=out, placeholder_map=placeholder_map)
 
 
-def restore_protected(text: str, placeholder_to_original: Dict[str, str]) -> str:
+def restore_protected(text: str, prot: ProtectedText) -> str:
     out = text
-    for ph, original in placeholder_to_original.items():
-        out = out.replace(ph, original)
+    for ph, val in prot.placeholder_map.items():
+        out = out.replace(ph, val)
     return out
 
 
-def parse_glossary_lines(raw: str) -> Dict[str, str]:
-    out: Dict[str, str] = {}
-    for line in (raw or "").splitlines():
-        line = line.strip()
-        if not line or line.startswith("#") or "=" not in line:
+def parse_glossary_lines(glossary_text: str) -> Dict[str, str]:
+    glossary: Dict[str, str] = {}
+    if not glossary_text:
+        return glossary
+    for raw in glossary_text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
             continue
-        k, v = line.split("=", 1)
-        k = k.strip()
-        v = v.strip()
-        if k and v:
-            out[k] = v
+        m = re.split(r"\s*(?:=>|->|=)\s*", line, maxsplit=1)
+        if len(m) == 2:
+            k, v = m[0].strip(), m[1].strip()
+            if k and v:
+                glossary[k] = v
+    return glossary
+
+
+def apply_glossary_hard(text: str, glossary: Dict[str, str]) -> str:
+    if not glossary or not text:
+        return text
+
+    out = text
+    for k in sorted(glossary.keys(), key=len, reverse=True):
+        v = glossary[k]
+        out = re.sub(rf"(?i)\b{re.escape(k)}\b", v, out)
     return out
