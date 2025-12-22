@@ -6,10 +6,10 @@ from datetime import datetime
 import streamlit as st
 
 from src.openai_translate import OpenAITranslator
+from src.text_utils import parse_glossary_lines
 from src.pdf_translate import translate_pdf_bytes
 from src.pptx_translate import translate_pptx_bytes
 from src.xlsm_translate import translate_xlsm_bytes
-from src.text_utils import parse_glossary_lines
 
 st.set_page_config(page_title="CKST Translator", layout="wide")
 
@@ -17,9 +17,6 @@ st.title("CKST Techpack Translator (PT-BR ➜ EN)")
 st.caption("PDF / PPTX / XLSM — handbag terminology focused")
 
 
-# -----------------------------
-# API key: load ONLY from secrets/env (never display)
-# -----------------------------
 def get_api_key() -> str:
     # Streamlit Cloud secrets
     try:
@@ -28,23 +25,14 @@ def get_api_key() -> str:
             return str(v)
     except Exception:
         pass
-    # Local env
+    # Local environment variable
     return os.getenv("OPENAI_API_KEY", "") or ""
 
 
 api_key = get_api_key()
 
-
-# -----------------------------
-# Sidebar (NO API KEY FIELD)
-# -----------------------------
 with st.sidebar:
     st.header("OpenAI")
-    if api_key:
-        st.success("OPENAI_API_KEY loaded (hidden)")
-    else:
-        st.error("OPENAI_API_KEY not found")
-        st.caption("Set OPENAI_API_KEY in Streamlit Secrets or as an environment variable.")
 
     model = st.selectbox(
         "Model",
@@ -68,15 +56,20 @@ with st.sidebar:
         "Reasoning effort (if supported)",
         options=["none", "low", "medium", "high", "xhigh"],
         index=2,
-        help="If your OpenAITranslator/model rejects this, set to 'none'.",
+        help="If the selected model rejects reasoning controls, set to 'none'.",
+    )
+
+# IMPORTANT: no message that mentions key presence/absence in sidebar
+if not api_key:
+    st.warning(
+        "OpenAI key is not configured.\n\n"
+        "• Streamlit Cloud: add `OPENAI_API_KEY` in Secrets.\n"
+        "• Local: set environment variable `OPENAI_API_KEY`.\n"
+        "Then reload."
     )
 
 st.divider()
 
-
-# -----------------------------
-# Glossary + instructions
-# -----------------------------
 colA, colB = st.columns([1, 1])
 
 with colA:
@@ -125,10 +118,6 @@ glossary = parse_glossary_lines(glossary_text)
 
 st.divider()
 
-
-# -----------------------------
-# Upload
-# -----------------------------
 uploaded_files = st.file_uploader(
     "Upload your files",
     type=["pdf", "pptx", "xlsm"],
@@ -138,41 +127,34 @@ uploaded_files = st.file_uploader(
 run = st.button("Translate to English", type="primary", disabled=not (uploaded_files and api_key))
 
 
-# -----------------------------
-# Helpers
-# -----------------------------
 def build_translator():
-    # Try the most feature-complete signature first
+    # Keep construction tolerant if your OpenAITranslator signature changes
     try:
         return OpenAITranslator(api_key=api_key, model=model, reasoning_effort=reasoning_effort)
     except TypeError:
         pass
-    # Try without reasoning_effort
     try:
         return OpenAITranslator(api_key=api_key, model=model)
     except TypeError:
         pass
-    # Positional fallback
     return OpenAITranslator(api_key, model)
 
 
 def call_translate(func, data: bytes, translator, on_progress):
     """
-    Tolerant wrapper so your existing src/pdf_translate.py and src/pptx_translate.py
-    don't need to be changed.
+    Call PDF/PPTX translators with the canonical signature, with fallbacks.
     """
     attempts = [
         lambda: func(
             data,
             translator,
-            on_progress=on_progress,
             source_lang="pt-BR",
             target_lang="en",
             glossary=glossary,
             extra_instructions=extra_instructions,
+            on_progress=on_progress,
         ),
-        lambda: func(data, translator, on_progress=on_progress, glossary=glossary, extra_instructions=extra_instructions),
-        lambda: func(data, translator, glossary=glossary, extra_instructions=extra_instructions),
+        lambda: func(data, translator, glossary=glossary, extra_instructions=extra_instructions, on_progress=on_progress),
         lambda: func(data, translator, on_progress=on_progress),
         lambda: func(data, translator),
         lambda: func(data),
@@ -186,9 +168,6 @@ def call_translate(func, data: bytes, translator, on_progress):
     raise last_err
 
 
-# -----------------------------
-# Run
-# -----------------------------
 if run:
     translator = build_translator()
 
@@ -203,17 +182,20 @@ if run:
         ext = filename.split(".")[-1].lower()
         data = uf.read()
 
+        # This line keeps filename visible, progress bar text stays clean
         status.info(f"Processing **{filename}** ({idx}/{total_files})")
 
-        per_file = st.progress(0.0, text=f"{filename}: preparing...")
+        per_file = st.progress(0.0, text="preparing...")
         per_label = st.empty()
 
         def on_progress(label: str, done: int, total: int):
             total = max(1, int(total))
             done = max(0, int(done))
             pct = min(1.0, done / total)
-            per_file.progress(pct, text=f"{filename}: {label} ({done}/{total})")
-            per_label.caption(f"{filename}: {label} ({done}/{total})")
+
+            # NOTE: No filename prefix here (fixes your #2 expectation)
+            per_file.progress(pct, text=f"{label} ({done}/{total})")
+            per_label.caption(f"{label} ({done}/{total})")
 
         try:
             if ext == "pdf":
@@ -227,7 +209,15 @@ if run:
                 mime = "application/vnd.openxmlformats-officedocument.presentationml.presentation"
 
             elif ext == "xlsm":
-                out_bytes = call_translate(translate_xlsm_bytes, data, translator, on_progress)
+                out_bytes = translate_xlsm_bytes(
+                    data,
+                    translator,
+                    source_lang="pt-BR",
+                    target_lang="en",
+                    glossary=glossary,
+                    extra_instructions=extra_instructions,
+                    on_progress=on_progress,
+                )
                 out_name = filename[:-5] + "_EN.xlsm"
                 mime = "application/vnd.ms-excel.sheet.macroEnabled.12"
 
