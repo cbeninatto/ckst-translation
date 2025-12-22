@@ -9,23 +9,21 @@ from src.openai_translate import OpenAITranslator
 from src.text_utils import parse_glossary_lines
 from src.pdf_translate import translate_pdf_bytes
 from src.pptx_translate import translate_pptx_bytes
-from src.xlsm_translate import translate_xlsm_bytes
+from src.xlsm_translate import translate_excel_to_xls_bytes
 
 st.set_page_config(page_title="CKST Translator", layout="wide")
 
 st.title("CKST Techpack Translator (PT-BR ➜ EN)")
-st.caption("PDF / PPTX / XLSM — handbag terminology focused")
+st.caption("PDF / PPTX / XLSM / XLS — handbag terminology focused")
 
 
 def get_api_key() -> str:
-    # Streamlit Cloud secrets
     try:
         v = st.secrets.get("OPENAI_API_KEY", "")
         if v:
             return str(v)
     except Exception:
         pass
-    # Local environment variable
     return os.getenv("OPENAI_API_KEY", "") or ""
 
 
@@ -56,10 +54,9 @@ with st.sidebar:
         "Reasoning effort (if supported)",
         options=["none", "low", "medium", "high", "xhigh"],
         index=2,
-        help="If the selected model rejects reasoning controls, set to 'none'.",
     )
 
-# IMPORTANT: do not print anything like “OPENAI_API_KEY loaded (hidden)”
+# Do NOT print anything about key being loaded/hidden
 if not api_key:
     st.warning(
         "OpenAI key is not configured.\n\n"
@@ -99,9 +96,9 @@ with colA:
             "entretela => interlining\n"
             "vivo => piping\n"
             "viés => binding tape\n"
-            "ouro batido => brushed gold\n"
+            "OURO BATIDO => BRUSH GOLD\n"
         ),
-        height=220,
+        height=240,
     )
 
 with colB:
@@ -110,9 +107,9 @@ with colB:
         value=(
             "Use handbag / softgoods manufacturing terminology.\n"
             "Keep measurements, codes, SKUs, and numbers unchanged.\n"
-            "Keep the structure and be factory-friendly."
+            "Be clear and factory-friendly."
         ),
-        height=220,
+        height=240,
     )
 
 glossary = parse_glossary_lines(glossary_text)
@@ -121,7 +118,7 @@ st.divider()
 
 uploaded_files = st.file_uploader(
     "Upload your files",
-    type=["pdf", "pptx", "xlsm"],
+    type=["pdf", "pptx", "xlsm", "xls"],
     accept_multiple_files=True,
 )
 
@@ -181,9 +178,7 @@ if run:
 
         status.info(f"Processing **{filename}** ({idx}/{total_files})")
 
-        # Main per-file bar (we'll show "pages" for XLSM, normal labels for others)
-        main_bar = st.progress(0.0, text="starting...")
-        # Secondary bar only for XLSM (cells/batches)
+        main_bar = st.progress(0.0, text="starting…")
         sub_ph = st.empty()
 
         def on_progress_generic(label: str, done: int, total: int):
@@ -192,12 +187,7 @@ if run:
             pct = min(1.0, done / total)
             main_bar.progress(pct, text=f"{label} ({done}/{total})")
 
-        def on_progress_xlsm(label: str, done: int, total: int):
-            """
-            XLSM uses two progress indicators:
-              - label 'pages' (tabs) -> main_bar
-              - label 'batches' -> sub bar
-            """
+        def on_progress_excel(label: str, done: int, total: int):
             total = max(1, int(total))
             done = max(0, int(done))
             pct = min(1.0, done / total)
@@ -205,8 +195,7 @@ if run:
             if label in ("pages", "sheets", "tabs"):
                 main_bar.progress(pct, text=f"pages ({done}/{total})")
             elif label in ("batches", "cells"):
-                # create/refresh sub progress bar
-                pb = sub_ph.progress(pct, text=f"cells ({done}/{total})")
+                sub_ph.progress(pct, text=f"batches ({done}/{total})")
             else:
                 main_bar.progress(pct, text=f"{label} ({done}/{total})")
 
@@ -221,20 +210,20 @@ if run:
                 out_name = filename[:-5] + "_EN.pptx"
                 mime = "application/vnd.openxmlformats-officedocument.presentationml.presentation"
 
-            elif ext == "xlsm":
-                out_bytes = translate_xlsm_bytes(
+            elif ext in ("xlsm", "xls"):
+                out_bytes = translate_excel_to_xls_bytes(
                     data,
-                    translator,
+                    input_ext=ext,
+                    translator=translator,
                     source_lang="pt-BR",
                     target_lang="en",
                     glossary=glossary,
                     extra_instructions=extra_instructions,
-                    on_progress=on_progress_xlsm,
+                    on_progress=on_progress_excel,
+                    batch_size=25,
                 )
-                out_name = filename[:-5] + "_EN.xlsm"
-                mime = "application/vnd.ms-excel.sheet.macroEnabled.12"
-
-                # Remove the sub bar after finishing
+                out_name = filename.rsplit(".", 1)[0] + "_EN.xls"
+                mime = "application/vnd.ms-excel"
                 sub_ph.empty()
 
             else:
