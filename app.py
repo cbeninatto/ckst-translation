@@ -8,7 +8,7 @@ import streamlit as st
 from src.openai_translate import OpenAITranslator
 from src.pdf_translate import translate_pdf_bytes
 from src.pptx_translate import translate_pptx_bytes
-from src.xlsm_translate import translate_xlsm_bytes  # ✅ NEW
+from src.xlsm_translate import translate_xlsm_bytes
 from src.text_utils import parse_glossary_lines
 
 
@@ -18,37 +18,62 @@ st.title("CKST Techpack Translator (PT-BR ➜ EN)")
 st.caption("PDF / PPTX / XLSM — handbag terminology focused")
 
 # -----------------------------
-# Sidebar
+# Load API key ONLY from secrets/env (never show it)
+# -----------------------------
+def get_api_key() -> str:
+    # Streamlit Cloud: set in Secrets as OPENAI_API_KEY
+    try:
+        v = st.secrets.get("OPENAI_API_KEY", "")
+        if v:
+            return v
+    except Exception:
+        pass
+    # Local: set as environment variable
+    return os.getenv("OPENAI_API_KEY", "") or ""
+
+
+api_key = get_api_key()
+
+# -----------------------------
+# Sidebar (NO API key input)
 # -----------------------------
 with st.sidebar:
     st.header("OpenAI")
 
-    # Prefer Streamlit secrets when available
-    secret_key = ""
-    try:
-        secret_key = st.secrets.get("OPENAI_API_KEY", "")
-    except Exception:
-        secret_key = ""
-
-    api_key = st.text_input("API Key", type="password", value=os.getenv("OPENAI_API_KEY", secret_key))
+    if api_key:
+        st.success("OPENAI_API_KEY loaded from Secrets / Environment")
+    else:
+        st.error("OPENAI_API_KEY not found")
+        st.caption("Set it in Streamlit Secrets or as an env var named OPENAI_API_KEY.")
 
     model = st.selectbox(
         "Model",
         options=[
+            # GPT-5.2 series
+            "gpt-5.2-pro",
+            "gpt-5.2",
+            # GPT-5.x / GPT-5 family
+            "gpt-5.1",
+            "gpt-5",
+            "gpt-5-mini",
+            "gpt-5-nano",
+            # GPT-4.1 family
             "gpt-4.1",
             "gpt-4.1-mini",
-            # keep these if you already had them:
+            "gpt-4.1-nano",
+            # other legacy/compat options if your org allows
             "gpt-4o",
             "o4-mini",
         ],
         index=0,
+        help="Some models are Responses-API-only depending on your translator implementation.",
     )
 
     reasoning_effort = st.selectbox(
         "Reasoning effort (if supported)",
-        options=["none", "low", "medium", "high"],
-        index=1,
-        help="Some models ignore this. If you get an API error, switch to 'none'.",
+        options=["none", "low", "medium", "high", "xhigh"],
+        index=2,
+        help="If you get an API error about this field, switch to 'none'.",
     )
 
 st.divider()
@@ -109,11 +134,12 @@ st.divider()
 # -----------------------------
 uploaded_files = st.file_uploader(
     "Upload your files",
-    type=["pdf", "pptx", "xlsm"],  # ✅ NEW
+    type=["pdf", "pptx", "xlsm"],
     accept_multiple_files=True,
 )
 
 run = st.button("Translate to English", type="primary", disabled=not (uploaded_files and api_key))
+
 
 # -----------------------------
 # Helpers
@@ -135,13 +161,13 @@ def build_translator():
     # Fallback positional
     return OpenAITranslator(api_key, model)
 
+
 def call_translate(func, data: bytes, translator, on_progress):
     """
     Be tolerant to different translate_* signatures across your src files.
     Tries multiple call patterns without changing your existing modules.
     """
     attempts = [
-        # most explicit
         lambda: func(
             data,
             translator,
@@ -164,8 +190,8 @@ def call_translate(func, data: bytes, translator, on_progress):
         except TypeError as e:
             last_err = e
             continue
-    # If nothing matched, raise the last TypeError
     raise last_err
+
 
 # -----------------------------
 # Run
@@ -189,7 +215,6 @@ if run:
         per_file = st.progress(0.0, text=f"{filename}: preparing...")
         per_label = st.empty()
 
-        # progress callback expected by your translate funcs
         def on_progress(label: str, done: int, total: int):
             total = max(1, int(total))
             done = max(0, int(done))
@@ -230,7 +255,6 @@ if run:
 
         overall.progress(idx / total_files, text=f"Processed {idx}/{total_files} file(s)")
 
-    # ZIP download
     if results:
         zbuf = io.BytesIO()
         with zipfile.ZipFile(zbuf, "w", zipfile.ZIP_DEFLATED) as zf:
