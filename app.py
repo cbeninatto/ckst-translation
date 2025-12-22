@@ -11,72 +11,68 @@ from src.pptx_translate import translate_pptx_bytes
 from src.xlsm_translate import translate_xlsm_bytes
 from src.text_utils import parse_glossary_lines
 
-
 st.set_page_config(page_title="CKST Translator", layout="wide")
 
 st.title("CKST Techpack Translator (PT-BR ➜ EN)")
 st.caption("PDF / PPTX / XLSM — handbag terminology focused")
 
+
 # -----------------------------
-# Load API key ONLY from secrets/env (never show it)
+# API key: load ONLY from secrets/env (never display)
 # -----------------------------
 def get_api_key() -> str:
-    # Streamlit Cloud: set in Secrets as OPENAI_API_KEY
+    # Streamlit Cloud secrets
     try:
         v = st.secrets.get("OPENAI_API_KEY", "")
         if v:
-            return v
+            return str(v)
     except Exception:
         pass
-    # Local: set as environment variable
+    # Local env
     return os.getenv("OPENAI_API_KEY", "") or ""
 
 
 api_key = get_api_key()
 
+
 # -----------------------------
-# Sidebar (NO API key input)
+# Sidebar (NO API KEY FIELD)
 # -----------------------------
 with st.sidebar:
     st.header("OpenAI")
-
     if api_key:
-        st.success("OPENAI_API_KEY loaded from Secrets / Environment")
+        st.success("OPENAI_API_KEY loaded (hidden)")
     else:
         st.error("OPENAI_API_KEY not found")
-        st.caption("Set it in Streamlit Secrets or as an env var named OPENAI_API_KEY.")
+        st.caption("Set OPENAI_API_KEY in Streamlit Secrets or as an environment variable.")
 
     model = st.selectbox(
         "Model",
         options=[
-            # GPT-5.2 series
             "gpt-5.2-pro",
             "gpt-5.2",
-            # GPT-5.x / GPT-5 family
             "gpt-5.1",
             "gpt-5",
             "gpt-5-mini",
             "gpt-5-nano",
-            # GPT-4.1 family
             "gpt-4.1",
             "gpt-4.1-mini",
             "gpt-4.1-nano",
-            # other legacy/compat options if your org allows
             "gpt-4o",
             "o4-mini",
         ],
         index=0,
-        help="Some models are Responses-API-only depending on your translator implementation.",
     )
 
     reasoning_effort = st.selectbox(
         "Reasoning effort (if supported)",
         options=["none", "low", "medium", "high", "xhigh"],
         index=2,
-        help="If you get an API error about this field, switch to 'none'.",
+        help="If your OpenAITranslator/model rejects this, set to 'none'.",
     )
 
 st.divider()
+
 
 # -----------------------------
 # Glossary + instructions
@@ -129,6 +125,7 @@ glossary = parse_glossary_lines(glossary_text)
 
 st.divider()
 
+
 # -----------------------------
 # Upload
 # -----------------------------
@@ -145,9 +142,6 @@ run = st.button("Translate to English", type="primary", disabled=not (uploaded_f
 # Helpers
 # -----------------------------
 def build_translator():
-    """
-    Be tolerant to different OpenAITranslator constructor versions.
-    """
     # Try the most feature-complete signature first
     try:
         return OpenAITranslator(api_key=api_key, model=model, reasoning_effort=reasoning_effort)
@@ -158,14 +152,14 @@ def build_translator():
         return OpenAITranslator(api_key=api_key, model=model)
     except TypeError:
         pass
-    # Fallback positional
+    # Positional fallback
     return OpenAITranslator(api_key, model)
 
 
 def call_translate(func, data: bytes, translator, on_progress):
     """
-    Be tolerant to different translate_* signatures across your src files.
-    Tries multiple call patterns without changing your existing modules.
+    Tolerant wrapper so your existing src/pdf_translate.py and src/pptx_translate.py
+    don't need to be changed.
     """
     attempts = [
         lambda: func(
@@ -189,7 +183,6 @@ def call_translate(func, data: bytes, translator, on_progress):
             return a()
         except TypeError as e:
             last_err = e
-            continue
     raise last_err
 
 
