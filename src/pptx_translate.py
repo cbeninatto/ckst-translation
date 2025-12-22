@@ -1,51 +1,100 @@
-import io
-from typing import Callable, Optional
+from __future__ import annotations
+
+from io import BytesIO
+from typing import Callable, Dict, List, Optional, Tuple
 
 from pptx import Presentation
 
 from .openai_translate import OpenAITranslator, TranslationItem, chunk_items
 
 
+def _rewrite_paragraph(paragraph, new_text: str) -> None:
+    runs = list(paragraph.runs)
+    if not runs:
+        paragraph.add_run().text = new_text
+        return
+    runs[0].text = new_text
+    for r in runs[1:]:
+        r.text = ""
+
+
+def _collect_slide_items(prs: Presentation, slide_idx: int) -> Tuple[List[TranslationItem], List[Tuple[str, object]]]:
+    slide = prs.slides[slide_idx]
+    items: List[TranslationItem] = []
+    targets: List[Tuple[str, object]] = []
+
+    for sh_i, shape in enumerate(slide.shapes):
+        # Tables
+        if getattr(shape, "has_table", False):
+            table = shape.table
+            for r in range(len(table.rows)):
+                for c in range(len(table.columns)):
+                    cell = table.cell(r, c)
+                    tf = getattr(cell, "text_frame", None)
+                    if not tf:
+                        continue
+                    for p_i, para in enumerate(tf.paragraphs):
+                        txt = (para.text or "").strip()
+                        if not txt:
+                            continue
+                        tid = f"s{slide_idx}_sh{sh_i}_cell{r}_{c}_p{p_i}"
+                        items.append(TranslationItem(tid, txt))
+                        targets.append((tid, para))
+            continue
+
+        # Text frames
+        if not getattr(shape, "has_text_frame", False):
+            continue
+        tf = shape.text_frame
+        if not tf:
+            continue
+        for p_i, para in enumerate(tf.paragraphs):
+            txt = (para.text or "").strip()
+            if not txt:
+                continue
+            tid = f"s{slide_idx}_sh{sh_i}_p{p_i}"
+            items.append(TranslationItem(tid, txt))
+            targets.append((tid, para))
+
+    return items, targets
+
+
 def translate_pptx_bytes(
     pptx_bytes: bytes,
     translator: OpenAITranslator,
-    on_progress: Optional[Callable[[str, int, int], None]] = None,
+    source_lang: str,
+    target_lang: str,
+    glossary: Dict[str, str],
+    extra_instructions: str,
+    on_progress: Optional[Callable[[int, int], None]] = None,  # (slide_1based, total)
 ) -> bytes:
-    prs = Presentation(io.BytesIO(pptx_bytes))
+    prs = Presentation(BytesIO(pptx_bytes))
     total = len(prs.slides)
 
-    for s_idx, slide in enumerate(prs.slides, start=1):
+    for s_i in range(total):
         if on_progress:
-            on_progress("slide", s_idx, total)
+            on_progress(s_i + 1, total)
 
-        items = []
-        targets = []
-        idx = 0
-
-        for shape in slide.shapes:
-            if not getattr(shape, "has_text_frame", False):
-                continue
-            tf = shape.text_frame
-            text = tf.text
-            if not text or not text.strip():
-                continue
-
-            item_id = f"s{s_idx}_t{idx}"
-            items.append(TranslationItem(item_id, text))
-            targets.append((shape, item_id))
-            idx += 1
-
+        items, targets = _collect_slide_items(prs, s_i)
         if not items:
             continue
 
-        mapping = {}
-        for chunk in chunk_items(items, max_items=30, max_chars=8000):
-            mapping.update(translator.translate_batch(chunk))
+        translations: Dict[str, str] = {}
+        for batch in chunk_items(items):
+            translations.update(
+                translator.translate_batch(
+                    batch,
+                    source_lang=source_lang,
+                    target_lang=target_lang,
+                    glossary=glossary,
+                    extra_instructions=extra_instructions,
+                )
+            )
 
-        for shape, item_id in targets:
-            translated = mapping.get(item_id, shape.text_frame.text)
-            shape.text_frame.text = translated
+        for tid, para in targets:
+            if tid in translations:
+                _rewrite_paragraph(para, translations[tid])
 
-    out = io.BytesIO()
+    out = BytesIO()
     prs.save(out)
     return out.getvalue()
