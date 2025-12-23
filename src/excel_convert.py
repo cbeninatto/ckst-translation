@@ -1,4 +1,3 @@
-import os
 import shutil
 import subprocess
 import tempfile
@@ -11,17 +10,15 @@ def soffice_available() -> bool:
 
 def convert_office_bytes(input_bytes: bytes, input_ext: str, output_ext: str) -> bytes:
     """
-    Converts office files using LibreOffice (soffice) headless.
+    Convert Office docs using LibreOffice (soffice) headless.
 
     input_ext/output_ext examples: "xls", "xlsx", "xlsm"
     Returns converted file bytes.
-
-    Raises RuntimeError if soffice is missing or conversion fails.
     """
     if not soffice_available():
         raise RuntimeError(
-            "LibreOffice (soffice) is not available on this system. "
-            "To convert XLS/XLSM to XLS, install LibreOffice and ensure 'soffice' is in PATH."
+            "LibreOffice (soffice) is not available. Install LibreOffice and ensure 'soffice' is in PATH. "
+            "On Streamlit Cloud add packages.txt with 'libreoffice'."
         )
 
     input_ext = input_ext.lower().lstrip(".")
@@ -32,14 +29,10 @@ def convert_office_bytes(input_bytes: bytes, input_ext: str, output_ext: str) ->
         in_path = td_path / f"input.{input_ext}"
         in_path.write_bytes(input_bytes)
 
-        # Try a couple filter strings for better compatibility
+        # Filters (xls needs a better hint sometimes)
         convert_to_candidates = []
         if output_ext == "xls":
             convert_to_candidates = ["xls", 'xls:"MS Excel 97"']
-        elif output_ext == "xlsx":
-            convert_to_candidates = ["xlsx"]
-        elif output_ext == "xlsm":
-            convert_to_candidates = ["xlsm"]
         else:
             convert_to_candidates = [output_ext]
 
@@ -61,15 +54,10 @@ def convert_office_bytes(input_bytes: bytes, input_ext: str, output_ext: str) ->
                 ]
                 subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
-                # Find output
-                outs = list(td_path.glob(f"input*.{output_ext}"))
+                outs = list(td_path.glob(f"*.{output_ext}"))
                 if not outs:
-                    # Sometimes LibreOffice changes the basename slightly; fallback:
-                    outs = list(td_path.glob(f"*.{output_ext}"))
-                if not outs:
-                    raise RuntimeError("Converted file not found after conversion.")
+                    raise RuntimeError("Converted file not found after LibreOffice conversion.")
                 return outs[0].read_bytes()
-
             except Exception as e:
                 last_err = e
 
