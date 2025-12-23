@@ -9,7 +9,7 @@ from src.openai_translate import OpenAITranslator
 from src.text_utils import parse_glossary_lines
 from src.pdf_translate import translate_pdf_bytes
 from src.pptx_translate import translate_pptx_bytes
-from src.xlsm_translate import translate_excel_to_xls_bytes  # <-- MUST EXIST
+from src.xlsm_translate import translate_excel_to_xls_bytes  # MUST exist
 
 
 st.set_page_config(page_title="CKST Translator", layout="wide")
@@ -19,7 +19,7 @@ st.caption("PDF / PPTX / XLSM / XLS — handbag terminology focused")
 
 
 def get_api_key() -> str:
-    # Don't show the key or any "loaded" status anywhere in the UI.
+    # Never show the key or any "loaded/hidden" message in the UI.
     try:
         v = st.secrets.get("OPENAI_API_KEY", "")
         if v:
@@ -119,7 +119,7 @@ run = st.button("Translate to English", type="primary", disabled=not (uploaded_f
 
 
 def build_translator():
-    # Keep it tolerant to different OpenAITranslator signatures
+    # Tolerant to different OpenAITranslator signatures
     try:
         return OpenAITranslator(api_key=api_key, model=model, reasoning_effort=reasoning_effort)
     except TypeError:
@@ -142,7 +142,13 @@ def call_translate(func, data: bytes, translator, on_progress):
             extra_instructions=extra_instructions,
             on_progress=on_progress,
         ),
-        lambda: func(data, translator, glossary=glossary, extra_instructions=extra_instructions, on_progress=on_progress),
+        lambda: func(
+            data,
+            translator,
+            glossary=glossary,
+            extra_instructions=extra_instructions,
+            on_progress=on_progress,
+        ),
         lambda: func(data, translator, on_progress=on_progress),
         lambda: func(data, translator),
         lambda: func(data),
@@ -173,8 +179,7 @@ if run:
         status.info(f"Processing **{filename}** ({idx}/{total_files})")
 
         main_bar = st.progress(0.0, text="starting…")
-        sub_bar = st.progress(0.0, text="")
-        sub_visible = False
+        batch_bar = st.progress(0.0, text="")  # used for Excel batches
 
         def on_progress_generic(label: str, done: int, total: int):
             total = max(1, int(total))
@@ -183,7 +188,6 @@ if run:
             main_bar.progress(pct, text=f"{label} ({done}/{total})")
 
         def on_progress_excel(label: str, done: int, total: int):
-            nonlocal sub_visible
             total = max(1, int(total))
             done = max(0, int(done))
             pct = min(1.0, done / total)
@@ -191,8 +195,7 @@ if run:
             if label in ("pages", "sheets", "tabs"):
                 main_bar.progress(pct, text=f"pages ({done}/{total})")
             elif label in ("batches",):
-                sub_visible = True
-                sub_bar.progress(pct, text=f"batches ({done}/{total})")
+                batch_bar.progress(pct, text=f"batches ({done}/{total})")
             else:
                 main_bar.progress(pct, text=f"{label} ({done}/{total})")
 
@@ -221,6 +224,7 @@ if run:
                 )
                 out_name = filename.rsplit(".", 1)[0] + "_EN.xls"
                 mime = "application/vnd.ms-excel"
+                batch_bar.empty()
 
             else:
                 raise ValueError(f"Unsupported file type: {ext}")
