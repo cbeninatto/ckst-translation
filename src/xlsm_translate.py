@@ -70,6 +70,7 @@ def _unmerge_outside_union(ws, min_row: int, max_row: int, min_col: int, max_col
 
 
 def _crop_sheet_to_union(ws, min_row: int, max_row: int, min_col: int, max_col: int) -> None:
+    # Delete outside bounds; after this, everything remaining is print area union
     if ws.max_row > max_row:
         ws.delete_rows(max_row + 1, ws.max_row - max_row)
     if min_row > 1:
@@ -101,6 +102,11 @@ def _chunk_list(items: List[TranslationItem], chunk_size: int) -> List[List[Tran
 
 
 def _find_afio_headers(ws, ranges: List[CellRange]) -> List[Tuple[int, int]]:
+    """
+    Find cells equal to 'AFIO' inside the print area.
+    Prefer column G (7).
+    Returns list of (row, col).
+    """
     found: List[Tuple[int, int]] = []
     found_col7: List[Tuple[int, int]] = []
     for cr in ranges:
@@ -108,35 +114,31 @@ def _find_afio_headers(ws, ranges: List[CellRange]) -> List[Tuple[int, int]]:
             for cell in row:
                 if isinstance(cell.value, str) and _norm(cell.value) == "AFIO":
                     found.append((cell.row, cell.column))
-                    if cell.column == 7:  # prefer column G
+                    if cell.column == 7:
                         found_col7.append((cell.row, cell.column))
     return found_col7 if found_col7 else found
 
 
 def _under_any_afio_header(r: int, c: int, headers: List[Tuple[int, int]]) -> bool:
-    for hr, hc in headers:
-        if c == hc and r > hr:
-            return True
-    return False
+    return any(c == hc and r > hr for hr, hc in headers)
 
 
 def translate_workbook_bytes_openpyxl(
     workbook_bytes: bytes,
     translator: OpenAITranslator,
-    source_lang: str = "pt-BR",
-    target_lang: str = "en",
-    glossary: Optional[Dict[str, str]] = None,
-    extra_instructions: str = "",
-    on_progress: Optional[Callable[[str, int, int], None]] = None,
-    batch_size: int = 25,
+    source_lang: str,
+    target_lang: str,
+    glossary: Dict[str, str],
+    extra_instructions: str,
+    on_progress: Optional[Callable[[str, int, int], None]],
+    batch_size: int,
 ) -> bytes:
     """
-    Translates an Excel workbook readable by openpyxl (xlsx/xlsm).
-    Returns same-format bytes as saved by openpyxl (typically xlsx-like container).
+    Translate xlsx/xlsm bytes using openpyxl.
+    Enforces: translate ONLY inside print area; delete everything outside print area union.
+    Special rule: Under AFIO column, if cell == 'NA COR', copy column C from same row (post-translation).
     """
-    glossary = glossary or {}
-
-    # Try keep_vba=True first (safe for xlsm); retry without if needed
+    # Try keep_vba=True first (safe for xlsm); if fails, retry without
     try:
         wb = openpyxl.load_workbook(io.BytesIO(workbook_bytes), keep_vba=True, data_only=False)
     except Exception:
@@ -144,7 +146,6 @@ def translate_workbook_bytes_openpyxl(
 
     sheets = wb.worksheets
     total_sheets = max(1, len(sheets))
-
     if on_progress:
         on_progress("pages", 0, total_sheets)
 
@@ -160,7 +161,7 @@ def translate_workbook_bytes_openpyxl(
         _unmerge_outside_union(ws, min_row, max_row, min_col, max_col)
 
         afio_headers = _find_afio_headers(ws, ranges)
-        na_cor_rows_for_afio: List[Tuple[int, int]] = []  # (row, afio_col)
+        na_cor_targets: List[Tuple[int, int]] = []  # (row, afio_col)
 
         items: List[TranslationItem] = []
         coords: List[Tuple[str, int, int]] = []
@@ -176,17 +177,20 @@ def translate_workbook_bytes_openpyxl(
                     v = cell.value
                     if not isinstance(v, str):
                         continue
+
                     raw = v
                     txt = raw.strip()
                     if not txt:
                         continue
+
+                    # Skip formulas
                     if cell.data_type == "f" or txt.startswith("="):
                         continue
 
-                    # AFIO rule
+                    # AFIO rule: if NA COR, don't translate; later copy column C
                     if afio_headers and _under_any_afio_header(cell.row, cell.column, afio_headers):
                         if _norm(raw) == "NA COR":
-                            na_cor_rows_for_afio.append((cell.row, cell.column))
+                            na_cor_targets.append((cell.row, cell.column))
                             continue
 
                     item_id = f"{ws.title}!{cell.coordinate}"
@@ -216,18 +220,18 @@ def translate_workbook_bytes_openpyxl(
             if on_progress:
                 on_progress("batches", b_idx, num_batches)
 
-        # Write translations
+        # Write translations back
         for item_id, r, c in coords:
             new_text = mapping.get(item_id)
             if isinstance(new_text, str):
                 ws.cell(row=r, column=c).value = apply_glossary_hard(new_text, glossary)
 
-        # AFIO NA COR -> copy translated column C (3)
-        for r, afio_col in na_cor_rows_for_afio:
+        # AFIO NA COR -> copy column C (3) value AFTER translation
+        for r, afio_col in na_cor_targets:
             src_val = ws.cell(row=r, column=3).value
             ws.cell(row=r, column=afio_col).value = "" if src_val is None else src_val
 
-        # Clear inside-union but outside print blocks
+        # Clear inside union but outside actual print blocks
         for r in range(min_row, max_row + 1):
             for c in range(min_col, max_col + 1):
                 if not _cell_in_ranges(r, c, ranges):
@@ -235,6 +239,7 @@ def translate_workbook_bytes_openpyxl(
                     if cell.value is not None:
                         cell.value = None
 
+        # Delete everything outside print area union and reset print area
         _crop_sheet_to_union(ws, min_row, max_row, min_col, max_col)
 
     out = io.BytesIO()
@@ -254,24 +259,26 @@ def translate_excel_to_xls_bytes(
     batch_size: int = 25,
 ) -> bytes:
     """
-    Accepts .xls or .xlsm (or .xlsx) input bytes and returns .xls output bytes.
-    Uses LibreOffice conversion to handle .xls input and .xls output.
+    Accept .xlsm or .xls input and ALWAYS return .xls output.
+    Uses LibreOffice:
+      - if input is .xls: convert to .xlsx first (openpyxl can't read .xls)
+      - translate via openpyxl
+      - convert translated workbook to .xls
     """
+    glossary = glossary or {}
     input_ext = input_ext.lower().lstrip(".")
 
-    # If input is .xls, convert to .xlsx first for openpyxl to read
     working_bytes = excel_bytes
     working_ext_for_soffice = input_ext
 
     if input_ext == "xls":
-        # Convert xls -> xlsx
+        # Convert legacy xls -> xlsx so openpyxl can read it
         working_bytes = convert_office_bytes(excel_bytes, "xls", "xlsx")
         working_ext_for_soffice = "xlsx"
 
-    # Translate with openpyxl
-    translated_bytes = translate_workbook_bytes_openpyxl(
-        working_bytes,
-        translator,
+    translated_openpyxl_bytes = translate_workbook_bytes_openpyxl(
+        workbook_bytes=working_bytes,
+        translator=translator,
         source_lang=source_lang,
         target_lang=target_lang,
         glossary=glossary,
@@ -280,7 +287,6 @@ def translate_excel_to_xls_bytes(
         batch_size=batch_size,
     )
 
-    # Convert translated workbook to .xls
-    # Use a "reasonable" input extension for LibreOffice to detect properly
-    # If original was xlsm, we still pass xlsx here (macros are not guaranteed to survive anyway)
-    return convert_office_bytes(translated_bytes, working_ext_for_soffice, "xls")
+    # Convert translated workbook -> xls
+    # (macros are not guaranteed to survive .xls output; that's expected)
+    return convert_office_bytes(translated_openpyxl_bytes, working_ext_for_soffice, "xls")
