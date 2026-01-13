@@ -112,7 +112,7 @@ st.divider()
 
 uploaded_files = st.file_uploader(
     "Upload your files",
-    type=["pdf", "pptx", "xlsm", "xls"],
+    type=["pdf", "pptx", "xlsm", "xls", "png", "jpg", "jpeg", "webp"],
     accept_multiple_files=True,
 )
 
@@ -210,6 +210,28 @@ if run:
                 out_bytes = call_translate(translate_pptx_bytes, data, translator, on_progress_generic)
                 out_name = filename[:-5] + "_EN.pptx"
                 mime = "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+
+            elif ext in ("png", "jpg", "jpeg", "webp"):
+                def on_progress_image(pct: float, msg: str):
+                    pct = max(0.0, min(1.0, float(pct)))
+                    main_bar.progress(pct, text=msg)
+
+                out_bytes = translate_image_bytes(
+                    image_bytes=data,
+                    filename=filename,
+                    api_key=api_key,
+                    model=model,
+                    source_lang="pt-BR",
+                    target_lang="en",
+                    glossary=glossary,
+                    extra_instructions=extra_instructions,
+                    progress_cb=on_progress_image,
+                )
+                out_name = filename.rsplit(".", 1)[0] + "_EN.png"
+                mime = "image/png"
+
+                st.image(out_bytes, caption=out_name, use_container_width=True)
+ 
 
             elif ext in ("xlsm", "xls"):
                 out_bytes = translate_excel_to_xls_bytes(
