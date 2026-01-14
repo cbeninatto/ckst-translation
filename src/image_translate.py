@@ -5,14 +5,15 @@ import base64
 import io
 import json
 import os
+import re
+from collections import Counter
 from typing import Callable, Dict, List, Optional, Literal, Tuple
 
-from PIL import Image, ImageDraw, ImageFont
-
+from PIL import Image, ImageDraw, ImageFont, ImageFilter
 from pydantic import BaseModel, Field
 from openai import OpenAI
 
-# If your project already has this helper, we use it; otherwise we fallback.
+# Optional: if your repo has apply_glossary_hard already
 try:
     from .text_utils import apply_glossary_hard  # type: ignore
 except Exception:
@@ -46,16 +47,28 @@ class ImageTranslationResult(BaseModel):
 # ----------------------------
 # Helpers
 # ----------------------------
+_RX_NUMBER_UNIT = re.compile(
+    r"(\d+(?:[.,]\d+)?\s*(?:cm|mm|m|kg|g|pcs|pc|un|usd|r\$|\$|€|£)?)",
+    re.IGNORECASE,
+)
+_RX_ONLY_PRICEISH = re.compile(r"^[\sA-Z$€£R0-9.,:+-]+$", re.IGNORECASE)
+
+
 def _to_data_url(image_bytes: bytes, mime: str) -> str:
     b64 = base64.b64encode(image_bytes).decode("utf-8")
     return f"data:{mime};base64,{b64}"
 
 
+def _guess_mime(filename: str) -> str:
+    f = filename.lower()
+    if f.endswith(".png"):
+        return "image/png"
+    if f.endswith(".webp"):
+        return "image/webp"
+    return "image/jpeg"
+
+
 def _pick_fonts() -> Tuple[Optional[str], Optional[str]]:
-    """
-    Choose common fonts available on Streamlit Cloud/Linux.
-    Fallback to None if not found (we'll use PIL default).
-    """
     candidates = [
         ("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"),
         ("/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf", "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf"),
@@ -66,15 +79,20 @@ def _pick_fonts() -> Tuple[Optional[str], Optional[str]]:
     return None, None
 
 
-def _luminance(rgb):
+def _luminance(rgb) -> float:
     r, g, b = rgb
     return (0.2126 * r + 0.7152 * g + 0.0722 * b) / 255.0
 
 
-def _sample_bg_color(img_rgba: Image.Image, px_box: Tuple[int, int, int, int], pad: int = 3) -> Tuple[int, int, int, int]:
+def _quantize_rgb(rgb: Tuple[int, int, int], step: int = 16) -> Tuple[int, int, int]:
+    # snap to buckets to get dominant background colors reliably
+    return tuple((c // step) * step for c in rgb)  # type: ignore
+
+
+def _dominant_bg_color(img_rgba: Image.Image, px_box: Tuple[int, int, int, int], pad: int = 4) -> Tuple[int, int, int, int]:
     """
-    Sample a background color around the bbox (edge pixels) and return RGBA fill.
-    Uses a thin ring around the box so we don't average the text itself.
+    Returns dominant (mode) color sampled around a bbox (thin ring).
+    This avoids blending red header + white background into pink.
     """
     x0, y0, x1, y1 = px_box
     w, h = img_rgba.size
@@ -84,29 +102,39 @@ def _sample_bg_color(img_rgba: Image.Image, px_box: Tuple[int, int, int, int], p
     x1c = min(w - 1, x1 + pad)
     y1c = min(h - 1, y1 + pad)
 
-    pixels = img_rgba.load()
-    samples: List[Tuple[int, int, int, int]] = []
+    px = img_rgba.load()
+    samples: List[Tuple[int, int, int]] = []
 
     # top/bottom edges
     for x in range(x0c, x1c + 1):
-        samples.append(pixels[x, y0c])
-        samples.append(pixels[x, y1c])
+        samples.append(px[x, y0c][:3])
+        samples.append(px[x, y1c][:3])
 
     # left/right edges
     for y in range(y0c, y1c + 1):
-        samples.append(pixels[x0c, y])
-        samples.append(pixels[x1c, y])
+        samples.append(px[x0c, y][:3])
+        samples.append(px[x1c, y][:3])
 
     if not samples:
         return (255, 255, 255, 255)
 
-    r = sum(p[0] for p in samples) // len(samples)
-    g = sum(p[1] for p in samples) // len(samples)
-    b = sum(p[2] for p in samples) // len(samples)
-    return (int(r), int(g), int(b), 255)
+    # quantize then take most common bucket
+    buckets = Counter(_quantize_rgb(s, step=16) for s in samples)
+    dom, _ = buckets.most_common(1)[0]
+    return (int(dom[0]), int(dom[1]), int(dom[2]), 255)
 
 
 def _wrap_to_width(draw: ImageDraw.ImageDraw, text: str, font: ImageFont.ImageFont, max_w: int) -> List[str]:
+    # We try hard NOT to wrap. Wrap only if a single line doesn't fit.
+    if not text:
+        return [""]
+
+    try:
+        if draw.textlength(text, font=font) <= max_w:
+            return [text]
+    except Exception:
+        pass
+
     words = text.split()
     if not words:
         return [""]
@@ -140,58 +168,44 @@ def _fit_text_in_box(
     max_size: int,
     min_size: int = 10,
 ) -> Tuple[ImageFont.ImageFont, List[str], int]:
-    """
-    Find a font size that fits text in the bbox, wrapping as needed.
-    Returns (font, lines, line_height).
-    """
     max_size = max(min_size, max_size)
 
     for size in range(max_size, min_size - 1, -1):
-        if font_path:
-            font = ImageFont.truetype(font_path, size=size)
-        else:
-            font = ImageFont.load_default()
+        font = ImageFont.truetype(font_path, size=size) if font_path else ImageFont.load_default()
 
         lines = _wrap_to_width(draw, text, font, box_w)
+
         try:
             ascent, descent = font.getmetrics()  # type: ignore
-            line_h = ascent + descent + int(size * 0.15)
+            line_h = ascent + descent + int(size * 0.12)
         except Exception:
-            line_h = int(size * 1.25)
+            line_h = int(size * 1.20)
 
-        total_h = line_h * len(lines)
-        if total_h <= box_h:
+        if line_h * len(lines) <= box_h:
             return font, lines, line_h
 
-    # last resort
-    if font_path:
-        font = ImageFont.truetype(font_path, size=min_size)
-    else:
-        font = ImageFont.load_default()
-
+    font = ImageFont.truetype(font_path, size=min_size) if font_path else ImageFont.load_default()
     lines = _wrap_to_width(draw, text, font, box_w)
     try:
         ascent, descent = font.getmetrics()  # type: ignore
-        line_h = ascent + descent + int(min_size * 0.15)
+        line_h = ascent + descent + int(min_size * 0.12)
     except Exception:
-        line_h = int(min_size * 1.25)
-
+        line_h = int(min_size * 1.20)
     return font, lines, line_h
 
 
 def _apply_glossary_force(text_en: str, glossary: Dict[str, str]) -> str:
-    """
-    Force glossary replacements after model translation.
-    This helps enforce things like OURO BATIDO -> BRUSH GOLD even if the model misses it.
-    """
+    if not glossary:
+        return text_en
+
     if apply_glossary_hard:
         try:
-            return apply_glossary_hard(text_en, glossary)
+            return apply_glossary_hard(text_en, glossary)  # type: ignore
         except Exception:
             pass
 
     out = text_en
-    for src, tgt in (glossary or {}).items():
+    for src, tgt in glossary.items():
         if not src or not tgt:
             continue
         out = out.replace(src, tgt)
@@ -200,13 +214,90 @@ def _apply_glossary_force(text_en: str, glossary: Dict[str, str]) -> str:
     return out
 
 
-def _guess_mime(filename: str) -> str:
-    f = filename.lower()
-    if f.endswith(".png"):
-        return "image/png"
-    if f.endswith(".webp"):
-        return "image/webp"
-    return "image/jpeg"
+def _preserve_numbers_and_formats(text_pt: str, text_en: str) -> str:
+    """
+    Preserve:
+    - comma decimal formatting (5,10)
+    - currency patterns
+    - dimension tokens like 45cm, 24cm
+    Strategy:
+    1) If it's essentially "price-ish" / numeric-only, keep source exactly.
+    2) Otherwise, replace numeric+unit tokens in EN with tokens from PT, in order.
+    """
+    pt = (text_pt or "").strip()
+    en = (text_en or "").strip()
+
+    if not pt:
+        return en
+
+    # 1) numeric-only / price-only lines: keep exactly (prevents 5,10 -> 5.10)
+    if _RX_ONLY_PRICEISH.match(pt) and len(re.sub(r"[^A-Za-z]", "", pt)) <= 3:
+        # e.g., "USD $ 5,10" or "$ 139,90" etc
+        return pt
+
+    pt_tokens = _RX_NUMBER_UNIT.findall(pt)
+    if not pt_tokens:
+        return en
+
+    # Find EN tokens and replace sequentially
+    en_tokens = _RX_NUMBER_UNIT.findall(en)
+    if not en_tokens:
+        # If EN doesn't contain tokens, just append nothing; keep EN as-is.
+        return en
+
+    out = en
+    for i, pt_tok in enumerate(pt_tokens):
+        if i < len(en_tokens):
+            out = out.replace(en_tokens[i], pt_tok, 1)
+    return out
+
+
+def _split_multiline_blocks(blocks: List[TextBlock]) -> List[TextBlock]:
+    """
+    Enforce ONE line per block. If the model returns multi-line text,
+    split and subdivide the bbox vertically.
+    """
+    out: List[TextBlock] = []
+    for b in blocks:
+        pt_lines = [ln.strip() for ln in (b.text_pt or "").splitlines() if ln.strip()]
+        en_lines = [ln.strip() for ln in (b.text_en or "").splitlines() if ln.strip()]
+
+        # If both are single-line, keep as-is
+        if len(pt_lines) <= 1 and len(en_lines) <= 1:
+            out.append(b)
+            continue
+
+        # Prefer splitting by PT lines count; fallback to EN
+        n = max(len(pt_lines), len(en_lines), 1)
+        y0, y1 = b.bbox.y0, b.bbox.y1
+        step = (y1 - y0) / n if n else (y1 - y0)
+
+        for i in range(n):
+            line_pt = pt_lines[i] if i < len(pt_lines) else (pt_lines[-1] if pt_lines else "")
+            line_en = en_lines[i] if i < len(en_lines) else (en_lines[-1] if en_lines else "")
+            nb = TextBlock(
+                id=f"{b.id}_{i+1}",
+                text_pt=line_pt,
+                text_en=line_en,
+                bbox=BBox(
+                    x0=b.bbox.x0,
+                    x1=b.bbox.x1,
+                    y0=max(0.0, min(1.0, y0 + step * i)),
+                    y1=max(0.0, min(1.0, y0 + step * (i + 1))),
+                ),
+                style=b.style,
+                align=b.align,
+            )
+            out.append(nb)
+    return out
+
+
+def _normalize_bbox(b: BBox) -> BBox:
+    x0 = max(0.0, min(1.0, min(b.x0, b.x1)))
+    x1 = max(0.0, min(1.0, max(b.x0, b.x1)))
+    y0 = max(0.0, min(1.0, min(b.y0, b.y1)))
+    y1 = max(0.0, min(1.0, max(b.y0, b.y1)))
+    return BBox(x0=x0, y0=y0, x1=x1, y1=y1)
 
 
 # ----------------------------
@@ -225,7 +316,7 @@ def translate_image_bytes(
 ) -> bytes:
     """
     Returns PNG bytes of translated image.
-    Behavior: ERASE original text areas, then OVERWRITE with translated English in the SAME positions.
+    Behavior: erase original text areas, then overwrite with translation at SAME positions.
     """
 
     def progress(p: float, msg: str):
@@ -235,9 +326,8 @@ def translate_image_bytes(
             except Exception:
                 pass
 
-    # Load image
     img = Image.open(io.BytesIO(image_bytes)).convert("RGBA")
-    orig_img = img.copy()  # keep pristine for background sampling
+    orig_img = img.copy()
     W, H = img.size
 
     progress(0.05, f"{filename}: detecting text regions…")
@@ -251,24 +341,25 @@ def translate_image_bytes(
     prompt = f"""
 You are translating Brazilian Portuguese handbag development sheets to English for Chinese factories.
 
-TASK:
-1) Identify ALL Portuguese text in the image that is relevant to the tech pack (titles, specs, bullets, measurements, notes, materials, components).
-2) For each text block, output:
-   - text_pt (exact original, preserve numbers/units/punctuation)
-   - text_en (English translation for handbag factories; use correct handbag/material/components terminology)
-   - bbox (x0,y0,x1,y1) normalized to image size (0..1), tight around the text
-   - style: "bold" if heading/bold, else "normal"
-   - align: left/center/right if clearly aligned
+OUTPUT REQUIREMENT (VERY IMPORTANT):
+- Return ONE line of text per block. Do NOT merge multiple lines into one block.
+- For paragraphs/bullets, output each visible line separately as its own block with its own bbox.
 
-IMPORTANT RULES:
-- Keep all numbers, currency, dimensions, and units exactly (cm, mm, USD, etc).
-- Prefer handbag terminology: lining, edge paint, piping, binding, strap, handle, zipper, puller, magnet snap, rivet, stitching, reinforcement, webbing, canvas, synthetic, PU, PVC.
-- Bounding boxes must fully cover glyphs, including accents and anti-aliased edges. Prefer slightly larger boxes over cropping letters.
+TASK:
+1) Identify ALL Portuguese text in the image relevant to the tech pack.
+2) For each line, output:
+   - text_pt (exact original, preserve punctuation)
+   - text_en (English translation; use correct handbag/material/components terminology; keep it concise so it fits)
+   - bbox (x0,y0,x1,y1) normalized (0..1), tight around THAT LINE ONLY
+   - style: "bold" if heading/bold
+   - align: left/center/right
+
+CRITICAL RULES:
+- Keep all numbers, currency, and dimension formatting EXACTLY as in Portuguese (including comma decimals like 5,10).
+- Keep units exactly (cm, mm, USD, etc).
+- Do not invent new measurements.
 - Apply glossary EXACTLY when the Portuguese source term appears:
 {glossary_lines}
-
-- If a block is already English, keep it unchanged.
-- Output JSON ONLY, matching the required schema.
 
 EXTRA INSTRUCTIONS:
 {extra_instructions}
@@ -278,9 +369,8 @@ EXTRA INSTRUCTIONS:
     data_url = _to_data_url(image_bytes, mime)
 
     # Vision + structured output
-    result: ImageTranslationResult
     try:
-        response = client.responses.parse(
+        resp = client.responses.parse(
             model=model,
             input=[
                 {
@@ -293,12 +383,11 @@ EXTRA INSTRUCTIONS:
             ],
             text_format=ImageTranslationResult,
         )
-        result = response.output_parsed  # type: ignore
+        result = resp.output_parsed  # type: ignore
         if result is None:
             raise ValueError("No parsed output returned.")
     except Exception:
-        # Fallback: request JSON and parse manually
-        response = client.responses.create(
+        resp = client.responses.create(
             model=model,
             input=[
                 {
@@ -310,62 +399,82 @@ EXTRA INSTRUCTIONS:
                 }
             ],
         )
-
-        raw = getattr(response, "output_text", None)
+        raw = getattr(resp, "output_text", None)
         if not raw:
-            # Try to extract from response.output if needed
-            raw = str(response)
+            raw = str(resp)
         result = ImageTranslationResult(**json.loads(raw))
+
+    # Normalize + split any multiline blocks defensively
+    blocks = []
+    for b in result.blocks:
+        b.bbox = _normalize_bbox(b.bbox)
+        # also force single-line strings (model sometimes returns embedded newlines)
+        b.text_pt = (b.text_pt or "").replace("\r", "\n")
+        b.text_en = (b.text_en or "").replace("\r", "\n")
+        blocks.append(b)
+
+    blocks = _split_multiline_blocks(blocks)
 
     progress(0.35, f"{filename}: erasing + overwriting text…")
 
     draw = ImageDraw.Draw(img)
     regular_font_path, bold_font_path = _pick_fonts()
 
-    # --- 1) ERASE PASS (remove Portuguese everywhere first) ---
-    ERASE_PAD = 6  # covers anti-aliasing / small bbox inaccuracies
+    # Build pixel boxes, compute dominant background per block
+    px_items: List[Tuple[TextBlock, Tuple[int, int, int, int], Tuple[int, int, int, int]]] = []
+    for b in blocks:
+        x0 = int(b.bbox.x0 * W)
+        y0 = int(b.bbox.y0 * H)
+        x1 = int(b.bbox.x1 * W)
+        y1 = int(b.bbox.y1 * H)
 
-    px_blocks: List[Tuple[TextBlock, Tuple[int, int, int, int], Tuple[int, int, int, int]]] = []
-    # store: (block, px_box, bg_fill)
+        # dynamic padding (bigger text needs bigger erase)
+        box_h = max(1, y1 - y0)
+        pad = max(6, int(box_h * 0.18))
+        x0p = max(0, x0 - pad)
+        y0p = max(0, y0 - pad)
+        x1p = min(W - 1, x1 + pad)
+        y1p = min(H - 1, y1 + pad)
 
-    for block in result.blocks:
-        x0 = int(block.bbox.x0 * W)
-        y0 = int(block.bbox.y0 * H)
-        x1 = int(block.bbox.x1 * W)
-        y1 = int(block.bbox.y1 * H)
-
-        x0 = max(0, x0 - ERASE_PAD)
-        y0 = max(0, y0 - ERASE_PAD)
-        x1 = min(W - 1, x1 + ERASE_PAD)
-        y1 = min(H - 1, y1 + ERASE_PAD)
-
-        if x1 <= x0 or y1 <= y0:
+        if x1p <= x0p or y1p <= y0p:
             continue
 
-        px_box = (x0, y0, x1, y1)
-        bg = _sample_bg_color(orig_img, px_box, pad=3)  # sample from original image
-        px_blocks.append((block, px_box, bg))
+        px_box = (x0p, y0p, x1p, y1p)
+        bg = _dominant_bg_color(orig_img, px_box, pad=4)
+        px_items.append((b, px_box, bg))
 
-    # Erase all regions first
-    for _, px_box, bg in px_blocks:
-        draw.rectangle(px_box, fill=bg)
+    # ERASE PASS:
+    # 1) blur the region to remove any ghosting (keeps background gradients)
+    # 2) paint a solid dominant color over it (ensures full removal)
+    for _, (x0, y0, x1, y1), bg in px_items:
+        crop = orig_img.crop((x0, y0, x1, y1))
+        # blur radius proportional to size
+        blur_r = max(6, min(18, int(min(x1 - x0, y1 - y0) * 0.12)))
+        crop_blur = crop.filter(ImageFilter.GaussianBlur(radius=blur_r))
+        img.paste(crop_blur, (x0, y0))
+        draw.rectangle((x0, y0, x1, y1), fill=bg)
 
-    # --- 2) WRITE PASS (overwrite with English in the same spot) ---
-    for i, (block, px_box, bg) in enumerate(px_blocks, start=1):
-        x0, y0, x1, y1 = px_box
+    # WRITE PASS:
+    for i, (b, (x0, y0, x1, y1), bg) in enumerate(px_items, start=1):
         box_w = max(1, x1 - x0)
         box_h = max(1, y1 - y0)
 
-        # Choose readable text color for the sampled background
         fg = (0, 0, 0, 255)
         if _luminance(bg[:3]) < 0.45:
             fg = (255, 255, 255, 255)
 
-        text_en = (block.text_en or "").strip()
+        text_en = (b.text_en or "").strip()
+        # force glossary
         text_en = _apply_glossary_force(text_en, glossary)
+        # preserve numeric formats (comma decimals, units)
+        text_en = _preserve_numbers_and_formats(b.text_pt, text_en)
 
-        font_path = bold_font_path if block.style == "bold" else regular_font_path
-        max_size = int(box_h * 0.90)
+        # If model returned empty for some reason, keep PT as fallback
+        if not text_en:
+            text_en = (b.text_pt or "").strip()
+
+        font_path = bold_font_path if b.style == "bold" else regular_font_path
+        max_size = max(10, int(box_h * 0.82))
 
         font, lines, line_h = _fit_text_in_box(
             draw=draw,
@@ -377,28 +486,30 @@ EXTRA INSTRUCTIONS:
             min_size=10,
         )
 
-        y = y0
+        # vertical centering within the erase box for a cleaner look
+        total_h = line_h * len(lines)
+        yy = y0 + max(0, (box_h - total_h) // 2)
+
         for line in lines:
             try:
                 line_w = int(draw.textlength(line, font=font))
             except Exception:
                 line_w = int(getattr(font, "getlength", lambda s: len(s) * 6)(line))
 
-            if block.align == "center":
-                tx = x0 + max(0, (box_w - line_w) // 2)
-            elif block.align == "right":
-                tx = x0 + max(0, box_w - line_w)
+            if b.align == "center":
+                xx = x0 + max(0, (box_w - line_w) // 2)
+            elif b.align == "right":
+                xx = x0 + max(0, box_w - line_w)
             else:
-                tx = x0
+                xx = x0
 
-            draw.text((tx, y), line, fill=fg, font=font)
-            y += line_h
-            if y > y1:
+            draw.text((xx, yy), line, fill=fg, font=font)
+            yy += line_h
+            if yy > y1:
                 break
 
-        progress(0.35 + 0.60 * (i / max(1, len(px_blocks))), f"{filename}: blocks ({i}/{len(px_blocks)})")
+        progress(0.35 + 0.60 * (i / max(1, len(px_items))), f"{filename}: blocks ({i}/{len(px_items)})")
 
-    # Export as PNG
     out = io.BytesIO()
     img.save(out, format="PNG")
     progress(1.0, f"{filename}: done")
