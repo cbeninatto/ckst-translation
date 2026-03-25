@@ -12,11 +12,7 @@ from src.pdf_translate import translate_pdf_bytes
 from src.pptx_translate import translate_pptx_bytes
 from src.xlsm_translate import translate_excel_to_xls_bytes  # MUST exist
 
-
 st.set_page_config(page_title="CKST Translator", layout="wide")
-
-st.title("CKST Techpack Translator (PT-BR ➜ EN)")
-st.caption("PDF / PPTX / XLSM / XLS — handbag terminology focused")
 
 
 def get_api_key() -> str:
@@ -30,10 +26,25 @@ def get_api_key() -> str:
     return os.getenv("OPENAI_API_KEY", "") or ""
 
 
+def suffix_for_lang(lang: str) -> str:
+    l = (lang or "").lower()
+    if l.startswith("en"):
+        return "EN"
+    if l.startswith("pt"):
+        return "PTBR"
+    return l.upper().replace("-", "").replace("_", "")
+
+
 api_key = get_api_key()
 
 with st.sidebar:
     st.header("OpenAI")
+
+    direction = st.selectbox(
+        "Direction",
+        options=["PT-BR → EN", "EN → PT-BR"],
+        index=0,
+    )
 
     model = st.selectbox(
         "Model",
@@ -59,6 +70,16 @@ with st.sidebar:
         index=2,
     )
 
+if direction == "PT-BR → EN":
+    source_lang = "pt-BR"
+    target_lang = "en"
+else:
+    source_lang = "en"
+    target_lang = "pt-BR"
+
+st.title(f"CKST Techpack Translator ({source_lang} ➜ {target_lang})")
+st.caption("PDF / PPTX / XLSM / XLS / Images — handbag terminology focused")
+
 if not api_key:
     st.warning(
         "OpenAI key is not configured.\n\n"
@@ -73,26 +94,17 @@ colA, colB = st.columns([1, 1])
 
 with colA:
     glossary_text = st.text_area(
-        "Glossary (optional) — one per line: `pt => en`",
+        f"Glossary (optional) — one per line: `{source_lang} => {target_lang}`",
         value=(
             "OURO BATIDO => BRUSH GOLD\n"
             "alça => strap\n"
-            "alça de ombro => shoulder strap\n"
-            "alça transversal => crossbody strap\n"
             "forro => lining\n"
             "ferragem => hardware\n"
-            "rebite => rivet\n"
-            "argola => ring\n"
-            "meia argola => D-ring\n"
             "zíper => zipper\n"
             "cursor => zipper puller\n"
-            "pesponto => topstitching\n"
-            "reforço => reinforcement\n"
-            "entretela => interlining\n"
-            "vivo => piping\n"
-            "viés => binding tape\n"
         ),
-        height=220,
+        height=240,
+        help="The glossary follows the direction you selected above.",
     )
 
 with colB:
@@ -103,7 +115,7 @@ with colB:
             "Keep measurements, codes, SKUs, and numbers unchanged.\n"
             "Be clear and factory-friendly."
         ),
-        height=220,
+        height=240,
     )
 
 glossary = parse_glossary_lines(glossary_text)
@@ -116,7 +128,7 @@ uploaded_files = st.file_uploader(
     accept_multiple_files=True,
 )
 
-run = st.button("Translate to English", type="primary", disabled=not (uploaded_files and api_key))
+run = st.button("Translate", type="primary", disabled=not (uploaded_files and api_key))
 
 
 def build_translator():
@@ -133,12 +145,17 @@ def build_translator():
 
 
 def call_translate(func, data: bytes, translator, on_progress):
+    """
+    Canonical signature:
+      func(data, translator, source_lang=..., target_lang=..., glossary=..., extra_instructions=..., on_progress=...)
+    With fallbacks.
+    """
     attempts = [
         lambda: func(
             data,
             translator,
-            source_lang="pt-BR",
-            target_lang="en",
+            source_lang=source_lang,
+            target_lang=target_lang,
             glossary=glossary,
             extra_instructions=extra_instructions,
             on_progress=on_progress,
@@ -171,6 +188,7 @@ if run:
     status = st.empty()
 
     total_files = len(uploaded_files)
+    suffix = suffix_for_lang(target_lang)
 
     for idx, uf in enumerate(uploaded_files, start=1):
         filename = uf.name
@@ -192,7 +210,6 @@ if run:
             total = max(1, int(total))
             done = max(0, int(done))
             pct = min(1.0, done / total)
-
             if label in ("pages", "sheets", "tabs"):
                 main_bar.progress(pct, text=f"pages ({done}/{total})")
             elif label in ("batches",):
@@ -203,15 +220,16 @@ if run:
         try:
             if ext == "pdf":
                 out_bytes = call_translate(translate_pdf_bytes, data, translator, on_progress_generic)
-                out_name = filename[:-4] + "_EN.pdf"
+                out_name = filename[:-4] + f"_{suffix}.pdf"
                 mime = "application/pdf"
 
             elif ext == "pptx":
                 out_bytes = call_translate(translate_pptx_bytes, data, translator, on_progress_generic)
-                out_name = filename[:-5] + "_EN.pptx"
+                out_name = filename[:-5] + f"_{suffix}.pptx"
                 mime = "application/vnd.openxmlformats-officedocument.presentationml.presentation"
 
             elif ext in ("png", "jpg", "jpeg", "webp"):
+
                 def on_progress_image(pct: float, msg: str):
                     pct = max(0.0, min(1.0, float(pct)))
                     main_bar.progress(pct, text=msg)
@@ -221,31 +239,29 @@ if run:
                     filename=filename,
                     api_key=api_key,
                     model=model,
-                    source_lang="pt-BR",
-                    target_lang="en",
+                    source_lang=source_lang,
+                    target_lang=target_lang,
                     glossary=glossary,
                     extra_instructions=extra_instructions,
                     progress_cb=on_progress_image,
                 )
-                out_name = filename.rsplit(".", 1)[0] + "_EN.png"
+                out_name = filename.rsplit(".", 1)[0] + f"_{suffix}.png"
                 mime = "image/png"
-
                 st.image(out_bytes, caption=out_name, use_container_width=True)
- 
 
             elif ext in ("xlsm", "xls"):
                 out_bytes = translate_excel_to_xls_bytes(
                     excel_bytes=data,
                     input_ext=ext,
                     translator=translator,
-                    source_lang="pt-BR",
-                    target_lang="en",
+                    source_lang=source_lang,
+                    target_lang=target_lang,
                     glossary=glossary,
                     extra_instructions=extra_instructions,
                     on_progress=on_progress_excel,
                     batch_size=25,
                 )
-                out_name = filename.rsplit(".", 1)[0] + "_EN.xls"
+                out_name = filename.rsplit(".", 1)[0] + f"_{suffix}.xls"
                 mime = "application/vnd.ms-excel"
                 batch_bar.empty()
 
@@ -272,7 +288,7 @@ if run:
             for out_name, out_bytes, _ in results:
                 zf.writestr(out_name, out_bytes)
 
-        zip_name = f"translations_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip"
+        zip_name = f"translations_{suffix}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip"
         st.download_button(
             "Download ALL as ZIP",
             data=zbuf.getvalue(),
