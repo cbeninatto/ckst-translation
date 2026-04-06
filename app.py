@@ -8,10 +8,9 @@ import streamlit as st
 from src.openai_translate import OpenAITranslator
 from src.text_utils import parse_glossary_lines
 from src.image_translate import translate_image_bytes
-from src.pdf_translate import translate_pdf_bytes
+from src.pdf_translate import translate_pdf_to_pptx_bytes
 from src.pptx_translate import translate_pptx_bytes
 from src.xlsm_translate import translate_excel_to_xls_bytes  # MUST exist
-from src.pdf_translate import translate_pdf_to_pptx_bytes
 
 st.set_page_config(page_title="CKST Translator", layout="wide")
 
